@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import requests
 import json
 import sys
 import os
+import re
 import math
 import importlib.util
 from datetime import datetime, timedelta
@@ -26,7 +28,14 @@ CLICKHOUSE_PASS = "clickhouse"
 USE_AI = False
 AI_API_KEY = "your_api_key_here"
 
-OUTPUT_DATA_FILE = "pmm_telemetry_last_3days.json"
+# Празно означава "генерирай име на файл според избрания период"
+OUTPUT_DATA_FILE = ""
+
+# Времеви прозорец: START/END са конкретни дати, LAST е относителен период (напр. 3d, 12h, 90m)
+START_TIME = ""
+END_TIME = ""
+LAST_PERIOD = "3d"
+STEP = "300s"  # 5 минути (300 секунди)
 
 # ==========================================
 # 2. ЗАРЕЖДАНЕ НА КОНФИГУРАЦИЯ ОТ ФАЙЛОВЕ
@@ -57,6 +66,11 @@ AI_API_KEY = os.getenv("AI_API_KEY", AI_API_KEY)
 
 OUTPUT_DATA_FILE = os.getenv("OUTPUT_DATA_FILE", OUTPUT_DATA_FILE)
 
+START_TIME = os.getenv("START_TIME", START_TIME)
+END_TIME = os.getenv("END_TIME", END_TIME)
+LAST_PERIOD = os.getenv("LAST_PERIOD", LAST_PERIOD)
+STEP = os.getenv("STEP", STEP)
+
 env_py_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env.py")
 if os.path.exists(env_py_path):
     try:
@@ -76,7 +90,12 @@ if os.path.exists(env_py_path):
         AI_API_KEY = getattr(custom_env, "AI_API_KEY", AI_API_KEY)
 
         OUTPUT_DATA_FILE = getattr(custom_env, "OUTPUT_DATA_FILE", OUTPUT_DATA_FILE)
-        
+
+        START_TIME = getattr(custom_env, "START_TIME", START_TIME)
+        END_TIME = getattr(custom_env, "END_TIME", END_TIME)
+        LAST_PERIOD = getattr(custom_env, "LAST_PERIOD", LAST_PERIOD)
+        STEP = getattr(custom_env, "STEP", STEP)
+
         print("ℹ️  Конфигурацията е заредена от env.py", file=sys.stderr)
     except Exception as e:
         print(f"⚠️ Грешка при зареждане на env.py: {e}", file=sys.stderr)
@@ -84,9 +103,137 @@ if os.path.exists(env_py_path):
 # ==========================================
 # 3. НАСТРОЙКИ НА ВРЕМЕВИ ПРОЗОРЕЦ И ЗАЯВКИ
 # ==========================================
-end_time = datetime.now()
-start_time = end_time - timedelta(days=3)
-STEP = "300s"  # 5 минути (300 секунди)
+DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d",
+)
+
+DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+
+def parse_datetime(value, option_name):
+    value = str(value).strip()
+
+    if value.lower() == "now":
+        return datetime.now()
+
+    if re.fullmatch(r"\d{9,}", value):
+        return datetime.fromtimestamp(int(value))
+
+    for fmt in DATETIME_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"Невалидна дата за {option_name}: '{value}'. "
+        "Позволени формати: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD HH:MM:SS', "
+        "UNIX timestamp или 'now'."
+    )
+
+
+def parse_duration(value, option_name):
+    value = str(value).strip().lower()
+    match = re.fullmatch(r"(\d+)\s*([mhdw])", value)
+    if not match:
+        raise ValueError(
+            f"Невалиден период за {option_name}: '{value}'. "
+            "Позволени формати: 90m, 12h, 3d, 2w."
+        )
+
+    amount, unit = int(match.group(1)), match.group(2)
+    if amount <= 0:
+        raise ValueError(f"Периодът за {option_name} трябва да е по-голям от нула.")
+
+    return timedelta(**{DURATION_UNITS[unit]: amount})
+
+
+def resolve_time_window(start_value, end_value, last_value):
+    """CLI/env стойностите се превръщат в конкретни начало и край на прозореца."""
+    start = parse_datetime(start_value, "--start") if start_value else None
+    end = parse_datetime(end_value, "--end") if end_value else None
+
+    if start and end:
+        pass
+    elif start:
+        end = datetime.now()
+    else:
+        end = end or datetime.now()
+        start = end - parse_duration(last_value, "--last")
+
+    if start >= end:
+        raise ValueError(
+            f"Началната дата ({start:%Y-%m-%d %H:%M}) трябва да е преди крайната "
+            f"({end:%Y-%m-%d %H:%M})."
+        )
+
+    return start, end
+
+
+def parse_step_seconds(value):
+    match = re.fullmatch(r"(\d+)\s*([smhd]?)", str(value).strip().lower())
+    if not match:
+        raise ValueError(
+            f"Невалидна стъпка за --step: '{value}'. Позволени формати: 30s, 300s, 5m, 1h."
+        )
+
+    amount = int(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    seconds = amount * multiplier
+    if seconds <= 0:
+        raise ValueError("Стъпката за --step трябва да е по-голяма от нула.")
+
+    return seconds
+
+
+def format_period(start, end):
+    hours = (end - start).total_seconds() / 3600
+    length = f"{hours / 24:.1f} дни" if hours >= 48 else f"{hours:.1f} часа"
+    return f"{start:%Y-%m-%d %H:%M} - {end:%Y-%m-%d %H:%M} ({length})"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Извлича PMM телеметрия за избран период и подготвя данните за AI анализ.",
+        epilog=(
+            "Примери:\n"
+            "  ./analyze.py --last 12h\n"
+            "  ./analyze.py --start '2026-08-10' --end '2026-08-12 18:00'\n"
+            "  ./analyze.py --start '2026-08-10 09:00'   # до сега\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--start",
+        default=START_TIME,
+        help="Начало на периода: 'YYYY-MM-DD[ HH:MM[:SS]]', UNIX timestamp или 'now'.",
+    )
+    parser.add_argument(
+        "--end",
+        default=END_TIME,
+        help="Край на периода в същите формати (по подразбиране: текущият момент).",
+    )
+    parser.add_argument(
+        "--last",
+        default=LAST_PERIOD,
+        help="Относителен период назад от края, ако не е зададено --start (напр. 90m, 12h, 3d, 2w). По подразбиране: 3d.",
+    )
+    parser.add_argument(
+        "--step",
+        default=STEP,
+        help="Стъпка на извадката за Prometheus (по подразбиране: 300s).",
+    )
+    parser.add_argument(
+        "--output",
+        default=OUTPUT_DATA_FILE,
+        help="Файл за суровите данни (по подразбиране: име, генерирано от периода).",
+    )
+    return parser.parse_args()
+
 
 PROMETHEUS_QUERIES = {
     "cpu_usage_pct": '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
@@ -114,8 +261,8 @@ PROMETHEUS_QUERIES = {
 # ==========================================
 # 4. ИЗВЛИЧАНЕ НА МЕТРИКИ ОТ PROMETHEUS API
 # ==========================================
-def fetch_prometheus_metrics():
-    print("⏳ Извличане на Prometheus метрики през PMM API (5-мин интервали)...")
+def fetch_prometheus_metrics(start_time, end_time, step):
+    print(f"⏳ Извличане на Prometheus метрики през PMM API (стъпка {step})...")
     time_series_data = {}
     
     session = requests.Session()
@@ -128,7 +275,7 @@ def fetch_prometheus_metrics():
             'query': query,
             'start': int(start_time.timestamp()),
             'end': int(end_time.timestamp()),
-            'step': STEP
+            'step': step
         }
         try:
             r = session.get(url, params=params, timeout=30)
@@ -164,7 +311,7 @@ def fetch_prometheus_metrics():
 # ==========================================
 # 5. ИЗВЛИЧАНЕ НА SQL ЗАЯВКИ ЧРЕЗ DOCKER EXEC
 # ==========================================
-def fetch_clickhouse_queries_via_docker():
+def fetch_clickhouse_queries_via_docker(start_time, end_time):
     print("⏳ Извличане на бавни SQL заявки от ClickHouse през `docker exec`...")
     
     clickhouse_sql = f"""
@@ -320,9 +467,35 @@ def analyze_with_ai(system_prompt, full_user_prompt_with_json):
 # ОСНОВНО ИЗПЪЛНЕНИЕ
 # ==========================================
 if __name__ == "__main__":
+    args = parse_args()
+
+    try:
+        start_time, end_time = resolve_time_window(args.start, args.end, args.last)
+        step_seconds = parse_step_seconds(args.step)
+    except ValueError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Prometheus отказва query_range с повече от 11000 точки на заявка
+    points = (end_time - start_time).total_seconds() / step_seconds
+    if points > 11000:
+        suggested = math.ceil((end_time - start_time).total_seconds() / 11000 / 60) * 60
+        print(
+            f"⚠️ Периодът дава {int(points)} точки при стъпка {args.step}, а Prometheus позволява "
+            f"максимум 11000. Използвайте --step {suggested}s или по-къс период.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    period_label = format_period(start_time, end_time)
+    output_file = args.output or (
+        f"pmm_telemetry_{start_time:%Y%m%d-%H%M}_{end_time:%Y%m%d-%H%M}.json"
+    )
+    print(f"🗓️  Анализиран период: {period_label}")
+
     # 1. Събиране на данни
-    metrics_history = fetch_prometheus_metrics()
-    top_queries = fetch_clickhouse_queries_via_docker()
+    metrics_history = fetch_prometheus_metrics(start_time, end_time, args.step)
+    top_queries = fetch_clickhouse_queries_via_docker(start_time, end_time)
     
     if not metrics_history:
         print("❌ Не бяха намерени метрики от Prometheus. Проверете PMM_URL и паролата.", file=sys.stderr)
@@ -330,7 +503,9 @@ if __name__ == "__main__":
         
     # 2. Пълен payload за запазване във файл
     full_payload = {
-        "granularity": "5 minutes",
+        "period_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "period_end": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "granularity": args.step,
         "total_time_points": len(metrics_history),
         "system_metrics_timeline": [
             {"t": ts, **metrics} for ts, metrics in sorted(metrics_history.items())
@@ -339,11 +514,11 @@ if __name__ == "__main__":
     }
     
     try:
-        with open(OUTPUT_DATA_FILE, "w", encoding="utf-8") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             json.dump(full_payload, f, indent=2, ensure_ascii=False)
-        print(f"💾 Пълните сурови данни са запазени във файл: {OUTPUT_DATA_FILE}")
+        print(f"💾 Пълните сурови данни са запазени във файл: {output_file}")
     except Exception as e:
-        print(f"⚠️ Грешка при запис във файл {OUTPUT_DATA_FILE}: {e}", file=sys.stderr)
+        print(f"⚠️ Грешка при запис във файл {output_file}: {e}", file=sys.stderr)
 
     # 3. Филтриране за AI
     summary_stats, anomaly_timeline = process_telemetry_for_ai(metrics_history)
@@ -352,14 +527,15 @@ if __name__ == "__main__":
     print(f"✅ Успешно филтрирани данни: от {len(metrics_history)} са оставени {len(anomaly_timeline)} критични точки ({tokens_saved_pct}% спестени токени).")
 
     ai_payload = {
-        "period_summary_3days": summary_stats,
+        "analyzed_period": period_label,
+        "period_summary": summary_stats,
         "anomalies_and_spikes_timeline": anomaly_timeline,
         "top_problematic_sql_queries": top_queries
     }
 
     # 4. Подготовка на промпта
-    system_prompt = """Ти си главен Database Reliability Engineer (DBRE) и Linux Performance Expert.
-Анализирай предоставените PMM телеметрични данни за последните 3 дни.
+    system_prompt = f"""Ти си главен Database Reliability Engineer (DBRE) и Linux Performance Expert.
+Анализирай предоставените PMM телеметрични данни за периода {period_label}.
 Забележка: Данните съдържат Общо статистическо резюме за целия период + хронологични отрязъци САМО за регистрираните пикове и аномалии (включително мрежов трафик MB/s и пакети/сек PPS), както и топ бавните SQL заявки от ClickHouse.
 
 Направи подробен Root Cause Analysis:
@@ -372,10 +548,13 @@ if __name__ == "__main__":
    - Системни, Мрежови и MySQL настройки (innodb_buffer_pool_size, swappiness, max_connections, txqueuelen и др.)."""
 
     # Декларираме текстовата част за изход на конзолата
-    user_prompt_display = f"Размер на изпращаните данни: {len(anomaly_timeline)} точки (от общо {len(metrics_history)})."
+    user_prompt_display = (
+        f"Период: {period_label}\n"
+        f"Размер на изпращаните данни: {len(anomaly_timeline)} точки (от общо {len(metrics_history)})."
+    )
 
     # Декларираме пълния user_prompt, който съдържа и JSON payload-а за подаване към API-то
-    full_user_prompt_with_json = f"""Моля, анализирай предоставените телеметрични данни от Percona Monitoring and Management (PMM) за последните 3 дни и направи Root Cause Analysis.
+    full_user_prompt_with_json = f"""Моля, анализирай предоставените телеметрични данни от Percona Monitoring and Management (PMM) за периода {period_label} и направи Root Cause Analysis.
 
 Ето структурираните данни за аномалии, обща статистика за периода и топ проблематични SQL заявки:
 
