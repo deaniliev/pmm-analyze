@@ -4,6 +4,8 @@
 
 This script scrapes the metrics locally and normalizes data to reduce cost of the ai analysis.
 
+This script scrapes only the basic metrics: CPU usage, CPU load, RAM usage, SWAP usage, DISK usage (including reads/writes) and DIGESTED slow queries.  
+
 How it works:
 
 1. Create .env file as per the .env.example
