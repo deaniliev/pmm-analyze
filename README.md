@@ -16,6 +16,9 @@ Take the json data and ask your favorite AI provider to analyze the data
 
 ## Choosing the time frame
 
+Run `python3 analyze.py --help` for the full guide on selecting a period, including all
+accepted date formats and worked examples.
+
 By default the script analyzes the last 3 days. Use `--start` / `--end` to pick an explicit
 window, or `--last` to change the relative one:
 

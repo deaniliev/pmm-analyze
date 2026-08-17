@@ -196,39 +196,91 @@ def format_period(start, end):
     return f"{start:%Y-%m-%d %H:%M} - {end:%Y-%m-%d %H:%M} ({length})"
 
 
+HELP_EPILOG = """
+ИЗБОР НА ВРЕМЕВИ ПЕРИОД
+  Периодът се определя от комбинацията на --start, --end и --last:
+
+    --start и --end        точният период между двете дати
+    само --start           от началната дата до текущия момент
+    само --end             период с дължина --last, завършващ на тази дата
+    без --start и --end    последните --last (по подразбиране 3d) до сега
+
+  Дати за --start и --end се приемат в следните формати:
+
+    2026-08-10             00:00 ч. на тази дата
+    '2026-08-10 14:30'     дата и час (кавичките са нужни заради интервала)
+    2026-08-10T14:30:00    ISO формат, работи и без кавички
+    1755000000             UNIX timestamp
+    now                    текущият момент
+
+  Продължителност за --last: 90m, 12h, 3d, 2w (минути, часове, дни, седмици).
+
+ПРИМЕРИ
+  python3 analyze.py
+      последните 3 дни (поведението по подразбиране)
+
+  python3 analyze.py --last 12h
+      последните 12 часа
+
+  python3 analyze.py --start '2026-08-10' --end '2026-08-12 18:00'
+      точен период, например докато е продължавал инцидент
+
+  python3 analyze.py --start '2026-08-10 09:00'
+      от този момент до сега
+
+  python3 analyze.py --end '2026-08-12 18:00' --last 6h
+      6 часа преди даден момент, за да се види какво е довело до него
+
+  python3 analyze.py --last 2w --step 20m
+      дълъг период с по-груба стъпка (виж бележката по-долу)
+
+ЗАБЕЛЕЖКИ
+  Prometheus връща максимум 11000 точки на заявка, затова дълъг период изисква
+  по-голяма стъпка. Скриптът проверява това предварително и предлага стойност
+  за --step, вместо да оставя заявките да се провалят.
+
+  Стойностите по подразбиране може да се зададат и в .env чрез START_TIME,
+  END_TIME, LAST_PERIOD, STEP и OUTPUT_DATA_FILE. Аргументите от командния ред
+  имат приоритет над .env.
+"""
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Извлича PMM телеметрия за избран период и подготвя данните за AI анализ.",
-        epilog=(
-            "Примери:\n"
-            "  ./analyze.py --last 12h\n"
-            "  ./analyze.py --start '2026-08-10' --end '2026-08-12 18:00'\n"
-            "  ./analyze.py --start '2026-08-10 09:00'   # до сега\n"
+        description=(
+            "Извлича PMM телеметрия за избран период, филтрира аномалиите и подготвя "
+            "данните за AI анализ."
         ),
+        epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--start",
+        metavar="ДАТА",
         default=START_TIME,
-        help="Начало на периода: 'YYYY-MM-DD[ HH:MM[:SS]]', UNIX timestamp или 'now'.",
+        help="Начало на периода. Виж форматите по-долу.",
     )
     parser.add_argument(
         "--end",
+        metavar="ДАТА",
         default=END_TIME,
-        help="Край на периода в същите формати (по подразбиране: текущият момент).",
+        help="Край на периода (по подразбиране: текущият момент).",
     )
     parser.add_argument(
         "--last",
+        metavar="ПЕРИОД",
         default=LAST_PERIOD,
-        help="Относителен период назад от края, ако не е зададено --start (напр. 90m, 12h, 3d, 2w). По подразбиране: 3d.",
+        help=f"Период назад от края, когато не е зададено --start (по подразбиране: {LAST_PERIOD}).",
     )
     parser.add_argument(
         "--step",
+        metavar="СТЪПКА",
         default=STEP,
-        help="Стъпка на извадката за Prometheus (по подразбиране: 300s).",
+        help=f"Стъпка на извадката за Prometheus (по подразбиране: {STEP}).",
     )
     parser.add_argument(
         "--output",
+        metavar="ФАЙЛ",
         default=OUTPUT_DATA_FILE,
         help="Файл за суровите данни (по подразбиране: име, генерирано от периода).",
     )
@@ -474,6 +526,7 @@ if __name__ == "__main__":
         step_seconds = parse_step_seconds(args.step)
     except ValueError as e:
         print(f"❌ {e}", file=sys.stderr)
+        print("   👉 Виж `python3 analyze.py --help` за избор на времеви период.", file=sys.stderr)
         sys.exit(2)
 
     # Prometheus отказва query_range с повече от 11000 точки на заявка
