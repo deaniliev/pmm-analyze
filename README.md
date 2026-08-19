@@ -9,12 +9,31 @@ This script scrapes the metrics locally and normalizes data to reduce cost of th
 How it works:
 
 1. Create .env file as per the .env.example
+   (or several, e.g. `.env-customer1`, and select one with `--config`)
 2. run the scripts by running
    python3 analyze.py
 
 3. The script will print the AI prompt including the system instructions
 
 Take the json data and ask your favorite AI provider to analyze the data
+
+## Selecting a config file
+
+Without `--config` the script reads `.env` from the current directory, falling back to `.env`
+next to the script. If neither exists it stops with an error instead of querying a default
+`localhost` PMM.
+
+Use `--config` to point at a specific file, which is handy when one host runs several PMM
+installations:
+
+```bash
+python3 analyze.py --config ./.env-customer1
+python3 analyze.py --config /root/.env-customer2 --last 12h
+```
+
+A missing `--config` file is reported and the script exits. Each file has the same format as
+`.env.example`. When `--config` is given, an `env.py` sitting next to the script is skipped so
+it cannot silently override the config you selected.
 
 ## Choosing the time frame
 

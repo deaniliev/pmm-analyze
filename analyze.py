@@ -40,39 +40,99 @@ STEP = "300s"  # 5 минути (300 секунди)
 # ==========================================
 # 2. ЗАРЕЖДАНЕ НА КОНФИГУРАЦИЯ ОТ ФАЙЛОВЕ
 # ==========================================
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    env_file = ".env"
-    if os.path.exists(env_file):
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, val = line.split("=", 1)
-                    os.environ[key.strip()] = val.strip().strip("'\"")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-PMM_CONTAINER_NAME = os.getenv("PMM_CONTAINER_NAME", PMM_CONTAINER_NAME)
-PMM_URL = os.getenv("PMM_URL", PMM_URL)
-PMM_USER = os.getenv("PMM_USER", PMM_USER)
-PMM_PASS = os.getenv("PMM_PASS", PMM_PASS)
 
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", CLICKHOUSE_USER)
-CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASS", CLICKHOUSE_PASS)
+class ConfigError(Exception):
+    """Липсващ или нечетим конфигурационен файл."""
 
-USE_AI = os.getenv("USE_AI", str(USE_AI)).lower() in ("true", "1", "yes")
-AI_API_KEY = os.getenv("AI_API_KEY", AI_API_KEY)
 
-OUTPUT_DATA_FILE = os.getenv("OUTPUT_DATA_FILE", OUTPUT_DATA_FILE)
+def default_config_candidates():
+    """Местата, където се търси .env, когато не е зададен --config."""
+    candidates = [os.path.abspath(".env")]
+    script_env = os.path.join(SCRIPT_DIR, ".env")
+    if script_env not in candidates:
+        candidates.append(script_env)
+    return candidates
 
-START_TIME = os.getenv("START_TIME", START_TIME)
-END_TIME = os.getenv("END_TIME", END_TIME)
-LAST_PERIOD = os.getenv("LAST_PERIOD", LAST_PERIOD)
-STEP = os.getenv("STEP", STEP)
 
-env_py_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env.py")
-if os.path.exists(env_py_path):
+def resolve_config_file(explicit_path):
+    if explicit_path:
+        path = os.path.abspath(os.path.expanduser(explicit_path))
+        if not os.path.isfile(path):
+            raise ConfigError(
+                f"⚠️ Зададеният конфигурационен файл не е намерен: {explicit_path}\n"
+                f"   Търсено в: {path}"
+            )
+        return path
+
+    candidates = default_config_candidates()
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    tried = "\n".join(f"   - {path}" for path in candidates)
+    raise ConfigError(
+        "❌ Не е намерен .env файл. Проверени места:\n"
+        f"{tried}\n"
+        "   Създайте .env по образец на .env.example или посочете друг файл с --config."
+    )
+
+
+def load_env_file(path):
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        # Резервен парсер, когато python-dotenv не е инсталиран
+        try:
+            values = {}
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, val = line.split("=", 1)
+                        values[key.strip()] = val.strip().strip("'\"")
+        except OSError as e:
+            raise ConfigError(f"❌ Конфигурационният файл не може да бъде прочетен: {e}")
+
+        # setdefault: реалната среда има приоритет над файла, както при python-dotenv
+        for key, val in values.items():
+            os.environ.setdefault(key, val)
+    else:
+        load_dotenv(path)
+
+
+def apply_env_config():
+    global PMM_CONTAINER_NAME, PMM_URL, PMM_USER, PMM_PASS
+    global CLICKHOUSE_USER, CLICKHOUSE_PASS
+    global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
+    global START_TIME, END_TIME, LAST_PERIOD, STEP
+
+    PMM_CONTAINER_NAME = os.getenv("PMM_CONTAINER_NAME", PMM_CONTAINER_NAME)
+    PMM_URL = os.getenv("PMM_URL", PMM_URL)
+    PMM_USER = os.getenv("PMM_USER", PMM_USER)
+    PMM_PASS = os.getenv("PMM_PASS", PMM_PASS)
+
+    CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", CLICKHOUSE_USER)
+    CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASS", CLICKHOUSE_PASS)
+
+    USE_AI = os.getenv("USE_AI", str(USE_AI)).lower() in ("true", "1", "yes")
+    AI_API_KEY = os.getenv("AI_API_KEY", AI_API_KEY)
+
+    OUTPUT_DATA_FILE = os.getenv("OUTPUT_DATA_FILE", OUTPUT_DATA_FILE)
+
+    START_TIME = os.getenv("START_TIME", START_TIME)
+    END_TIME = os.getenv("END_TIME", END_TIME)
+    LAST_PERIOD = os.getenv("LAST_PERIOD", LAST_PERIOD)
+    STEP = os.getenv("STEP", STEP)
+
+
+def apply_env_py(env_py_path):
+    global PMM_CONTAINER_NAME, PMM_URL, PMM_USER, PMM_PASS
+    global CLICKHOUSE_USER, CLICKHOUSE_PASS
+    global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
+    global START_TIME, END_TIME, LAST_PERIOD, STEP
+
     try:
         spec = importlib.util.spec_from_file_location("custom_env", env_py_path)
         custom_env = importlib.util.module_from_spec(spec)
@@ -96,9 +156,43 @@ if os.path.exists(env_py_path):
         LAST_PERIOD = getattr(custom_env, "LAST_PERIOD", LAST_PERIOD)
         STEP = getattr(custom_env, "STEP", STEP)
 
-        print("ℹ️  Конфигурацията е заредена от env.py", file=sys.stderr)
+        print("ℹ️  Конфигурацията е допълнена от env.py", file=sys.stderr)
     except Exception as e:
         print(f"⚠️ Грешка при зареждане на env.py: {e}", file=sys.stderr)
+
+
+def load_config(explicit_path):
+    """Зарежда конфигурацията и връща пътя на използвания файл."""
+    if not explicit_path:
+        print(
+            "ℹ️  Не е зададен --config, търси се .env по подразбиране.",
+            file=sys.stderr,
+        )
+
+    path = resolve_config_file(explicit_path)
+    load_env_file(path)
+    apply_env_config()
+
+    env_py_path = os.path.join(SCRIPT_DIR, "env.py")
+    if os.path.exists(env_py_path):
+        if explicit_path:
+            # Иначе env.py би подменил изрично избраната конфигурация
+            print(
+                f"ℹ️  env.py е пропуснат заради --config {explicit_path}",
+                file=sys.stderr,
+            )
+        else:
+            apply_env_py(env_py_path)
+
+    return path
+
+
+def parse_config_arg(argv):
+    """Изважда --config преди основния парсер, защото от него зависят стойностите по подразбиране."""
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config")
+    known_args, _ = pre_parser.parse_known_args(argv)
+    return known_args.config
 
 # ==========================================
 # 3. НАСТРОЙКИ НА ВРЕМЕВИ ПРОЗОРЕЦ И ЗАЯВКИ
@@ -234,14 +328,27 @@ HELP_EPILOG = """
   python3 analyze.py --last 2w --step 20m
       дълъг период с по-груба стъпка (виж бележката по-долу)
 
+КОНФИГУРАЦИЯ
+  Без --config се използва .env от текущата директория, а ако липсва там - .env
+  до самия скрипт. Ако не бъде намерен нито един, скриптът спира с грешка.
+
+  С --config се посочва конкретен файл, което е удобно при няколко PMM
+  инсталации на един хост:
+
+    python3 analyze.py --config ./.env-customer1
+    python3 analyze.py --config /root/.env-customer2 --last 12h
+
+  Файлът има формата на .env.example. Когато е зададен --config, евентуален
+  env.py до скрипта се пропуска, за да не подмени избраната конфигурация.
+
 ЗАБЕЛЕЖКИ
   Prometheus връща максимум 11000 точки на заявка, затова дълъг период изисква
   по-голяма стъпка. Скриптът проверява това предварително и предлага стойност
   за --step, вместо да оставя заявките да се провалят.
 
-  Стойностите по подразбиране може да се зададат и в .env чрез START_TIME,
-  END_TIME, LAST_PERIOD, STEP и OUTPUT_DATA_FILE. Аргументите от командния ред
-  имат приоритет над .env.
+  Стойностите по подразбиране може да се зададат и в конфигурационния файл чрез
+  START_TIME, END_TIME, LAST_PERIOD, STEP и OUTPUT_DATA_FILE. Аргументите от
+  командния ред имат приоритет.
 """
 
 
@@ -253,6 +360,11 @@ def parse_args():
         ),
         epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        metavar="ФАЙЛ",
+        help="Конфигурационен файл (по подразбиране: .env в текущата директория или до скрипта).",
     )
     parser.add_argument(
         "--start",
@@ -519,6 +631,17 @@ def analyze_with_ai(system_prompt, full_user_prompt_with_json):
 # ОСНОВНО ИЗПЪЛНЕНИЕ
 # ==========================================
 if __name__ == "__main__":
+    # --config се обработва преди parse_args(), защото конфигурацията определя
+    # стойностите по подразбиране на останалите аргументи.
+    help_requested = any(arg in ("-h", "--help") for arg in sys.argv[1:])
+    try:
+        config_file = load_config(parse_config_arg(sys.argv[1:]))
+        print(f"ℹ️  Конфигурация: {config_file}", file=sys.stderr)
+    except ConfigError as e:
+        if not help_requested:
+            print(e, file=sys.stderr)
+            sys.exit(2)
+
     args = parse_args()
 
     try:
