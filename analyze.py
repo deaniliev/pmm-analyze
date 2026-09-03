@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import subprocess
 import requests
 import json
 import sys
@@ -8,7 +7,7 @@ import os
 import re
 import math
 import importlib.util
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Ignore warnings about a self-signed SSL certificate (InsecureRequestWarning)
 import urllib3
@@ -17,13 +16,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==========================================
 # 1. DEFAULT VALUES
 # ==========================================
-PMM_CONTAINER_NAME = "pmm-server"
 PMM_URL = "https://localhost:8443"
 PMM_USER = "admin"
 PMM_PASS = "your_pmm_password"
-
-CLICKHOUSE_USER = "default"
-CLICKHOUSE_PASS = "clickhouse"
 
 USE_AI = False
 AI_API_KEY = "your_api_key_here"
@@ -103,18 +98,13 @@ def load_env_file(path):
 
 
 def apply_env_config():
-    global PMM_CONTAINER_NAME, PMM_URL, PMM_USER, PMM_PASS
-    global CLICKHOUSE_USER, CLICKHOUSE_PASS
+    global PMM_URL, PMM_USER, PMM_PASS
     global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
     global START_TIME, END_TIME, LAST_PERIOD, STEP
 
-    PMM_CONTAINER_NAME = os.getenv("PMM_CONTAINER_NAME", PMM_CONTAINER_NAME)
     PMM_URL = os.getenv("PMM_URL", PMM_URL)
     PMM_USER = os.getenv("PMM_USER", PMM_USER)
     PMM_PASS = os.getenv("PMM_PASS", PMM_PASS)
-
-    CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", CLICKHOUSE_USER)
-    CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASS", CLICKHOUSE_PASS)
 
     USE_AI = os.getenv("USE_AI", str(USE_AI)).lower() in ("true", "1", "yes")
     AI_API_KEY = os.getenv("AI_API_KEY", AI_API_KEY)
@@ -128,8 +118,7 @@ def apply_env_config():
 
 
 def apply_env_py(env_py_path):
-    global PMM_CONTAINER_NAME, PMM_URL, PMM_USER, PMM_PASS
-    global CLICKHOUSE_USER, CLICKHOUSE_PASS
+    global PMM_URL, PMM_USER, PMM_PASS
     global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
     global START_TIME, END_TIME, LAST_PERIOD, STEP
 
@@ -138,13 +127,9 @@ def apply_env_py(env_py_path):
         custom_env = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(custom_env)
 
-        PMM_CONTAINER_NAME = getattr(custom_env, "PMM_CONTAINER_NAME", PMM_CONTAINER_NAME)
         PMM_URL = getattr(custom_env, "PMM_URL", PMM_URL)
         PMM_USER = getattr(custom_env, "PMM_USER", PMM_USER)
         PMM_PASS = getattr(custom_env, "PMM_PASS", PMM_PASS)
-
-        CLICKHOUSE_USER = getattr(custom_env, "CLICKHOUSE_USER", CLICKHOUSE_USER)
-        CLICKHOUSE_PASS = getattr(custom_env, "CLICKHOUSE_PASS", CLICKHOUSE_PASS)
 
         USE_AI = getattr(custom_env, "USE_AI", USE_AI)
         AI_API_KEY = getattr(custom_env, "AI_API_KEY", AI_API_KEY)
@@ -424,27 +409,151 @@ PROMETHEUS_QUERIES = {
 }
 
 # ==========================================
-# 4. FETCHING METRICS FROM THE PROMETHEUS API
+# 4. PMM HTTP SESSION AND VERSION DETECTION
 # ==========================================
-def fetch_prometheus_metrics(start_time, end_time, step):
-    print(f"⏳ Fetching Prometheus metrics via the PMM API (step {step})...")
-    time_series_data = {}
-    
+PMM_VERSION_ENDPOINTS = (
+    "/v1/server/version",  # PMM 3
+    "/v1/version",         # PMM 2 (and some PMM 3 installs)
+)
+
+QAN_API = {
+    2: {
+        "report": "/v0/qan/GetReport",
+        "example": "/v0/qan/ObjectDetails/GetQueryExample",
+        "labels": "/v0/qan/ObjectDetails/GetLabels",
+    },
+    3: {
+        "report": "/v1/qan/metrics:getReport",
+        "example": "/v1/qan/query:getExample",
+        "labels": "/v1/qan:getLabels",
+    },
+}
+
+QAN_QUERY_LIMIT = 10
+
+PMM_REQUEST_TIMEOUT = 30
+
+
+class PmmApiError(Exception):
+    """PMM HTTP API is unreachable, unauthorized, or returned an unexpected version."""
+
+
+def pmm_session():
     session = requests.Session()
     session.auth = (PMM_USER, PMM_PASS)
     session.verify = False
+    session.headers["Accept"] = "application/json"
+    return session
+
+
+def pmm_url(path):
+    return f"{PMM_URL.rstrip('/')}{path}"
+
+
+def to_rfc3339_utc(dt):
+    """QAN timestamps are RFC3339. Naive values are treated as local time."""
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _first_string(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def extract_pmm_version_string(payload):
+    if not isinstance(payload, dict):
+        return ""
+    version = _first_string(payload.get("version"))
+    if version:
+        return version
+    server = payload.get("server")
+    if isinstance(server, dict):
+        return _first_string(server.get("version"))
+    return ""
+
+
+def parse_pmm_major(version_string):
+    match = re.match(r"v?(\d+)", version_string.strip())
+    if not match:
+        return None
+    major = int(match.group(1))
+    if major in QAN_API:
+        return major
+    return None
+
+
+def detect_pmm_version(session):
+    """Return (major, version_string) for PMM 2 or 3."""
+    print("⏳ Detecting PMM version...")
+    last_error = None
+    auth_error = None
+
+    for path in PMM_VERSION_ENDPOINTS:
+        try:
+            response = session.get(pmm_url(path), timeout=PMM_REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            last_error = f"{path}: {e}"
+            continue
+
+        if response.status_code in (401, 403):
+            auth_error = (
+                f"Authentication error from {path} (HTTP {response.status_code}). "
+                "Check PMM_USER and PMM_PASS."
+            )
+            last_error = f"{path}: HTTP {response.status_code}"
+            continue
+
+        if response.status_code != 200:
+            last_error = f"{path}: HTTP {response.status_code}"
+            continue
+
+        try:
+            payload = response.json()
+        except ValueError:
+            last_error = f"{path}: response is not JSON"
+            continue
+
+        version_string = extract_pmm_version_string(payload)
+        major = parse_pmm_major(version_string)
+        if major is None:
+            last_error = f"{path}: unrecognized version {version_string!r}"
+            continue
+
+        print(f"✅ PMM {major} ({version_string})")
+        return major, version_string
+
+    if auth_error:
+        raise PmmApiError(auth_error)
+
+    detail = f" Last error: {last_error}" if last_error else ""
+    raise PmmApiError(
+        "Could not detect PMM 2 or PMM 3 from the version API "
+        f"({', '.join(PMM_VERSION_ENDPOINTS)}).{detail}"
+    )
+
+
+# ==========================================
+# 5. FETCHING METRICS FROM THE PROMETHEUS API
+# ==========================================
+def fetch_prometheus_metrics(session, start_time, end_time, step):
+    print(f"⏳ Fetching Prometheus metrics via the PMM API (step {step})...")
+    time_series_data = {}
 
     for metric_name, query in PROMETHEUS_QUERIES.items():
-        url = f"{PMM_URL.rstrip('/')}/prometheus/api/v1/query_range"
+        url = pmm_url("/prometheus/api/v1/query_range")
         params = {
-            'query': query,
-            'start': int(start_time.timestamp()),
-            'end': int(end_time.timestamp()),
-            'step': step
+            "query": query,
+            "start": int(start_time.timestamp()),
+            "end": int(end_time.timestamp()),
+            "step": step,
         }
         try:
-            r = session.get(url, params=params, timeout=30)
-            
+            r = session.get(url, params=params, timeout=PMM_REQUEST_TIMEOUT)
+
             if r.status_code != 200:
                 print(f"⚠️ HTTP {r.status_code} for {metric_name}.", file=sys.stderr)
                 if r.status_code in (401, 403):
@@ -453,13 +562,13 @@ def fetch_prometheus_metrics(start_time, end_time, step):
                 continue
 
             res = r.json()
-            if res.get('status') == 'success' and res.get('data', {}).get('result'):
-                metrics_values = res['data']['result'][0].get('values', [])
+            if res.get("status") == "success" and res.get("data", {}).get("result"):
+                metrics_values = res["data"]["result"][0].get("values", [])
                 for ts, val in metrics_values:
-                    time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                    time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
                     if time_str not in time_series_data:
                         time_series_data[time_str] = {}
-                    
+
                     try:
                         float_val = float(val)
                         if not math.isnan(float_val) and not math.isinf(float_val):
@@ -470,62 +579,239 @@ def fetch_prometheus_metrics(start_time, end_time, step):
                         time_series_data[time_str][metric_name] = None
         except Exception as e:
             print(f"⚠️ Error fetching metric {metric_name}: {e}", file=sys.stderr)
-            
+
     return time_series_data
 
+
 # ==========================================
-# 5. FETCHING SQL QUERIES VIA DOCKER EXEC
+# 6. FETCHING SQL QUERIES VIA THE QAN HTTP API
 # ==========================================
-def fetch_clickhouse_queries_via_docker(start_time, end_time):
-    print("⏳ Fetching slow SQL queries from ClickHouse via `docker exec`...")
-    
-    clickhouse_sql = f"""
-    SELECT 
-        fingerprint AS query_signature,
-        any(example) AS sample_sql,
-        groupUniqArray(schema) AS schemas,
-        groupUniqArray(database) AS databases,
-        groupUniqArray(service_name) AS service_names,
-        sum(m_query_time_cnt) AS total_executions,
-        round(sum(m_query_time_sum) / sum(m_query_time_cnt), 4) AS avg_latency_sec,
-        round(max(m_query_time_max), 2) AS max_latency_sec,
-        round(sum(m_rows_examined_sum), 0) AS total_rows_examined
-    FROM pmm.metrics
-    WHERE period_start >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
-      AND period_start <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
-      AND example != ''
-    GROUP BY fingerprint
-    HAVING total_executions > 0
-    ORDER BY avg_latency_sec DESC
-    LIMIT 10
-    FORMAT JSON
-    """
-    
-    cmd = [
-        "docker", "exec", "-i", PMM_CONTAINER_NAME,
-        "sh", "-c",
-        f"clickhouse-client --user='{CLICKHOUSE_USER}' --password='{CLICKHOUSE_PASS}' --database=pmm --query \"{clickhouse_sql}\""
-    ]
-    
-    try:
-        result = subprocess.run(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            check=True
+def _qan_post(session, path, payload):
+    response = session.post(
+        pmm_url(path),
+        json=payload,
+        timeout=PMM_REQUEST_TIMEOUT,
+        headers={"Content-Type": "application/json"},
+    )
+    if response.status_code in (401, 403):
+        raise PmmApiError(
+            f"Authentication error from {path} (HTTP {response.status_code}). "
+            "Check PMM_USER and PMM_PASS."
         )
-        stdout_text = result.stdout.decode('utf-8')
-        data = json.loads(stdout_text)
-        queries = attach_query_databases(data.get('data', []))
-        print(f"✅ Successfully fetched {len(queries)} slow SQL queries.")
-        return queries
-    except subprocess.CalledProcessError as e:
-        err_msg = e.stderr.decode('utf-8').strip() if e.stderr else str(e)
-        print(f"❌ Error fetching ClickHouse queries via Docker: {err_msg}", file=sys.stderr)
-    except Exception as e:
-        print(f"❌ Error parsing ClickHouse JSON: {e}", file=sys.stderr)
-        
-    return []
+    if response.status_code != 200:
+        snippet = (response.text or "").strip().replace("\n", " ")[:300]
+        raise PmmApiError(f"{path} returned HTTP {response.status_code}: {snippet}")
+    try:
+        return response.json()
+    except ValueError as e:
+        raise PmmApiError(f"{path} returned invalid JSON: {e}") from e
+
+
+def _metric_stats(row, name):
+    metrics = row.get("metrics") or {}
+    cell = metrics.get(name) or {}
+    if not isinstance(cell, dict):
+        return {}
+    stats = cell.get("stats")
+    return stats if isinstance(stats, dict) else cell
+
+
+def _metric_number(stats, *keys):
+    for key in keys:
+        value = stats.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _round_or_none(value, digits):
+    if value is None:
+        return None
+    return round(value, digits)
+
+
+def _is_totals_row(row):
+    dimension = _first_string(row.get("dimension"), row.get("Dimension"))
+    fingerprint = _first_string(row.get("fingerprint"), row.get("Fingerprint"))
+    if not dimension:
+        return True
+    if fingerprint.upper() == "TOTAL":
+        return True
+    if dimension.upper() == "TOTAL":
+        return True
+    return False
+
+
+def _label_values(labels_payload, *names):
+    if not isinstance(labels_payload, dict):
+        return []
+    wanted = {name.lower() for name in names}
+    collected = []
+    for key, raw in labels_payload.items():
+        if str(key).lower() not in wanted:
+            continue
+        values = []
+        if isinstance(raw, dict):
+            values = raw.get("values") or raw.get("value") or []
+        elif isinstance(raw, list):
+            values = raw
+        elif isinstance(raw, str):
+            values = [raw]
+        collected.extend(values)
+    return _nonempty_unique(collected)
+
+
+def _example_text(example):
+    if not isinstance(example, dict):
+        return ""
+    return _first_string(
+        example.get("example"),
+        example.get("Example"),
+        example.get("explain_fingerprint"),
+        example.get("explainFingerprint"),
+    )
+
+
+def fetch_qan_example(session, path, period, queryid):
+    payload = {
+        **period,
+        "group_by": "queryid",
+        "filter_by": queryid,
+        "limit": 1,
+    }
+    data = _qan_post(session, path, payload)
+    examples = data.get("query_examples") or data.get("queryExamples") or []
+    if not examples:
+        return {}, ""
+    example = examples[0] if isinstance(examples[0], dict) else {}
+    return example, _example_text(example)
+
+
+def fetch_qan_labels(session, path, period, queryid):
+    payload = {
+        **period,
+        "group_by": "queryid",
+        "filter_by": queryid,
+    }
+    data = _qan_post(session, path, payload)
+    return data.get("labels") or {}
+
+
+def qan_row_to_query(session, paths, period, row):
+    queryid = _first_string(row.get("dimension"), row.get("Dimension"))
+    fingerprint = _first_string(row.get("fingerprint"), row.get("Fingerprint"))
+    database = _first_string(row.get("database"), row.get("Database"))
+
+    query_time = _metric_stats(row, "query_time")
+    rows_examined = _metric_stats(row, "rows_examined")
+    num_queries_stats = _metric_stats(row, "num_queries")
+
+    total_executions = _metric_number(num_queries_stats, "sum", "cnt")
+    if total_executions is None:
+        for key in ("num_queries", "numQueries"):
+            try:
+                if row.get(key) is not None:
+                    total_executions = float(row[key])
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    example = {}
+    sample_sql = ""
+    labels = {}
+    try:
+        example, sample_sql = fetch_qan_example(session, paths["example"], period, queryid)
+    except PmmApiError as e:
+        print(f"⚠️ Could not fetch a query example for {queryid}: {e}", file=sys.stderr)
+    try:
+        labels = fetch_qan_labels(session, paths["labels"], period, queryid)
+    except PmmApiError as e:
+        print(f"⚠️ Could not fetch QAN labels for {queryid}: {e}", file=sys.stderr)
+
+    schemas = _nonempty_unique(
+        [
+            example.get("schema"),
+            example.get("Schema"),
+        ]
+        + _label_values(labels, "schema")
+    )
+    databases = _nonempty_unique(
+        [
+            database,
+            example.get("database"),
+            example.get("Database"),
+        ]
+        + _label_values(labels, "database")
+        + schemas
+    )
+    service_names = _nonempty_unique(
+        [
+            example.get("service_name"),
+            example.get("serviceName"),
+        ]
+        + _label_values(labels, "service_name", "serviceName")
+    )
+
+    query = {
+        "queryid": queryid,
+        "query_signature": fingerprint,
+        "sample_sql": sample_sql or fingerprint,
+        "service_names": service_names,
+        "databases": databases,
+        "total_executions": int(total_executions) if total_executions is not None else 0,
+        "avg_latency_sec": _round_or_none(_metric_number(query_time, "avg"), 4),
+        "max_latency_sec": _round_or_none(_metric_number(query_time, "max"), 2),
+        "total_rows_examined": _round_or_none(_metric_number(rows_examined, "sum"), 0),
+        "database": databases[0] if databases else "",
+    }
+    if schemas and set(schemas) != set(databases):
+        query["schemas"] = schemas
+    return query
+
+
+def fetch_qan_queries(session, pmm_major, start_time, end_time):
+    paths = QAN_API[pmm_major]
+    period = {
+        "period_start_from": to_rfc3339_utc(start_time),
+        "period_start_to": to_rfc3339_utc(end_time),
+    }
+    print(f"⏳ Fetching slow SQL queries via the PMM {pmm_major} QAN API...")
+
+    report_payload = {
+        **period,
+        "group_by": "queryid",
+        "order_by": "-query_time",
+        "main_metric": "query_time",
+        "limit": QAN_QUERY_LIMIT,
+        "offset": 0,
+        "columns": ["query_time", "rows_examined", "num_queries"],
+    }
+
+    try:
+        report = _qan_post(session, paths["report"], report_payload)
+    except PmmApiError as e:
+        print(f"❌ Error fetching QAN report: {e}", file=sys.stderr)
+        return []
+
+    rows = report.get("rows") or report.get("Rows") or []
+    queries = []
+    for row in rows:
+        if not isinstance(row, dict) or _is_totals_row(row):
+            continue
+        try:
+            queries.append(qan_row_to_query(session, paths, period, row))
+        except Exception as e:
+            queryid = _first_string(row.get("dimension"), row.get("Dimension")) or "?"
+            print(f"⚠️ Skipping QAN row {queryid}: {e}", file=sys.stderr)
+        if len(queries) >= QAN_QUERY_LIMIT:
+            break
+
+    print(f"✅ Successfully fetched {len(queries)} slow SQL queries.")
+    return queries
 
 
 def _nonempty_unique(values):
@@ -535,29 +821,8 @@ def _nonempty_unique(values):
             seen.append(value)
     return seen
 
-
-def attach_query_databases(queries):
-    """Attach the database/schema each query was observed in.
-
-    In PMM ClickHouse, `schema` is the MySQL database (and the PostgreSQL schema),
-    while `database` is the PostgreSQL database/catalog. One fingerprint can
-    appear in more than one database, so a list is kept.
-    """
-    for query in queries:
-        schemas = _nonempty_unique(query.pop("schemas", None))
-        pg_databases = _nonempty_unique(query.pop("databases", None))
-        service_names = _nonempty_unique(query.get("service_names"))
-
-        query["service_names"] = service_names
-        # MySQL: schema holds the database name; PostgreSQL: database is the catalog.
-        query["databases"] = pg_databases or schemas
-        if schemas and pg_databases:
-            query["schemas"] = schemas
-        query["database"] = query["databases"][0] if query["databases"] else ""
-    return queries
-
 # ==========================================
-# 6. FILTERING ANOMALIES AND REDUCING THE DATA
+# 7. FILTERING ANOMALIES AND REDUCING THE DATA
 # ==========================================
 def process_telemetry_for_ai(metrics_history):
     timeline = [{"t": ts, **metrics} for ts, metrics in sorted(metrics_history.items())]
@@ -634,7 +899,7 @@ def process_telemetry_for_ai(metrics_history):
     return summary_stats, filtered_timeline
 
 # ==========================================
-# 7. AI ROOT CAUSE ANALYSIS
+# 8. AI ROOT CAUSE ANALYSIS
 # ==========================================
 def analyze_with_ai(system_prompt, full_user_prompt_with_json):
     print("\n🧠 Sending the optimized payload to AI for Root Cause analysis...", file=sys.stderr)
@@ -702,10 +967,17 @@ if __name__ == "__main__":
     )
     print(f"🗓️  Analyzed period: {period_label}")
 
+    session = pmm_session()
+    try:
+        pmm_major, _pmm_version = detect_pmm_version(session)
+    except PmmApiError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
+
     # 1. Collect data
-    metrics_history = fetch_prometheus_metrics(start_time, end_time, args.step)
-    top_queries = fetch_clickhouse_queries_via_docker(start_time, end_time)
-    
+    metrics_history = fetch_prometheus_metrics(session, start_time, end_time, args.step)
+    top_queries = fetch_qan_queries(session, pmm_major, start_time, end_time)
+
     if not metrics_history:
         print("❌ No Prometheus metrics were found. Check PMM_URL and the password.", file=sys.stderr)
         sys.exit(1)
@@ -745,7 +1017,7 @@ if __name__ == "__main__":
     # 4. Prepare the prompt
     system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
 Analyze the provided PMM telemetry data for the period {period_label}.
-Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS), as well as the top slow SQL queries from ClickHouse.
+Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS), as well as the top slow SQL queries from Query Analytics (QAN).
 
 Produce a detailed Root Cause Analysis:
 1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks in CPU, Load, Swap, Disk I/O, Network Throughput/PPS or Slow Queries in the anomaly timeline?
