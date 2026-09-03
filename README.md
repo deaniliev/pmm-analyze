@@ -9,9 +9,12 @@ This script scrapes the metrics locally and normalizes data to reduce cost of th
 How it works:
 
 1. Create .env file as per the .env.example
+   
    (or several, e.g. `.env-customer1`, and select one with `--config`)
+   
 2. run the scripts by running
-   python3 analyze.py
+   
+   python3 analyze.py --config .env
 
 3. The script will print the AI prompt including the system instructions
 
