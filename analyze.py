@@ -405,7 +405,12 @@ PROMETHEUS_QUERIES = {
     "mysql_slow_queries_rate": 'rate(mysql_global_status_slow_queries[5m])',
     "mysql_active_threads": 'mysql_global_status_threads_running',
     "mysql_connected_threads": 'mysql_global_status_threads_connected',
-    "mysql_queries_rate": 'rate(mysql_global_status_queries[5m])'
+    "mysql_queries_rate": 'rate(mysql_global_status_queries[5m])',
+
+    # process-exporter (https://github.com/ncabatoff/process-exporter), scraped as a PMM external service
+    "process_count": 'sum(namedprocess_namegroup_num_procs)',
+    "process_rss_gb": 'sum(namedprocess_namegroup_memory_bytes{memtype="resident"}) / 1024 / 1024 / 1024',
+    "process_swap_mb": 'sum(namedprocess_namegroup_memory_bytes{memtype="swapped"}) / 1024 / 1024',
 }
 
 # ==========================================
@@ -430,6 +435,7 @@ QAN_API = {
 }
 
 QAN_QUERY_LIMIT = 10
+PROCESS_GROUP_LIMIT = 10
 
 PMM_REQUEST_TIMEOUT = 30
 
@@ -581,6 +587,132 @@ def fetch_prometheus_metrics(session, start_time, end_time, step):
             print(f"⚠️ Error fetching metric {metric_name}: {e}", file=sys.stderr)
 
     return time_series_data
+
+
+def _parse_prom_float(value):
+    try:
+        float_val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(float_val) or math.isinf(float_val):
+        return None
+    return float_val
+
+
+def prometheus_instant_query(session, query, when):
+    """Run a Prometheus instant query at `when`. Returns a list of {metric, value}."""
+    url = pmm_url("/prometheus/api/v1/query")
+    params = {
+        "query": query,
+        "time": int(when.timestamp()),
+    }
+    try:
+        response = session.get(url, params=params, timeout=PMM_REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"⚠️ Process-exporter query failed: {e}", file=sys.stderr)
+        return []
+
+    if response.status_code in (401, 403):
+        print("⚠️ Authentication error while fetching process-exporter metrics.", file=sys.stderr)
+        return []
+    if response.status_code != 200:
+        print(
+            f"⚠️ HTTP {response.status_code} for process-exporter query.",
+            file=sys.stderr,
+        )
+        return []
+
+    try:
+        payload = response.json()
+    except ValueError as e:
+        print(f"⚠️ Invalid JSON for process-exporter query: {e}", file=sys.stderr)
+        return []
+
+    if payload.get("status") != "success":
+        return []
+
+    series = []
+    for item in payload.get("data", {}).get("result") or []:
+        metric = item.get("metric") or {}
+        raw = (item.get("value") or [None, None])[1]
+        value = _parse_prom_float(raw)
+        if value is None:
+            continue
+        series.append({"metric": metric, "value": value})
+    return series
+
+
+def _process_group_identity(metric):
+    groupname = _first_string(metric.get("groupname"), metric.get("group"))
+    node_name = _first_string(metric.get("node_name"), metric.get("nodeName"))
+    service_name = _first_string(metric.get("service_name"), metric.get("serviceName"))
+    return groupname, node_name, service_name
+
+
+def fetch_top_process_groups(session, start_time, end_time):
+    """Top process-exporter groups by peak RSS and process count over the window."""
+    print("⏳ Fetching process-exporter groups via the PMM API...")
+    duration_s = max(int((end_time - start_time).total_seconds()), 60)
+    duration = f"{duration_s}s"
+    limit = PROCESS_GROUP_LIMIT
+
+    count_query = (
+        f"topk({limit}, max_over_time(namedprocess_namegroup_num_procs[{duration}]))"
+    )
+    rss_query = (
+        f"topk({limit}, max_over_time("
+        f'namedprocess_namegroup_memory_bytes{{memtype="resident"}}[{duration}]))'
+    )
+
+    groups = {}
+    for series in prometheus_instant_query(session, count_query, end_time):
+        groupname, node_name, service_name = _process_group_identity(series["metric"])
+        if not groupname:
+            continue
+        entry = groups.setdefault(
+            (groupname, node_name, service_name),
+            {"groupname": groupname, "node_name": node_name, "service_name": service_name},
+        )
+        entry["process_count"] = round(series["value"], 2)
+
+    for series in prometheus_instant_query(session, rss_query, end_time):
+        groupname, node_name, service_name = _process_group_identity(series["metric"])
+        if not groupname:
+            continue
+        entry = groups.setdefault(
+            (groupname, node_name, service_name),
+            {"groupname": groupname, "node_name": node_name, "service_name": service_name},
+        )
+        entry["rss_gb"] = round(series["value"] / 1024 / 1024 / 1024, 2)
+
+    ranked = []
+    for entry in groups.values():
+        item = {"groupname": entry["groupname"]}
+        if entry.get("node_name"):
+            item["node_name"] = entry["node_name"]
+        if entry.get("service_name"):
+            item["service_name"] = entry["service_name"]
+        if "process_count" in entry:
+            item["process_count"] = entry["process_count"]
+        if "rss_gb" in entry:
+            item["rss_gb"] = entry["rss_gb"]
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: (item.get("rss_gb") or 0, item.get("process_count") or 0),
+        reverse=True,
+    )
+    ranked = ranked[:limit]
+
+    if ranked:
+        print(f"✅ Successfully fetched {len(ranked)} process-exporter groups.")
+    else:
+        print(
+            "⚠️ No process-exporter metrics found (namedprocess_namegroup_*). "
+            "Confirm the external service is being scraped by PMM.",
+            file=sys.stderr,
+        )
+    return ranked
 
 
 # ==========================================
@@ -863,6 +995,8 @@ def process_telemetry_for_ai(metrics_history):
         net_tx_mb = pt.get("net_tx_mb_s", 0) or 0
         net_rx_pps = pt.get("net_rx_pps", 0) or 0
         net_tx_pps = pt.get("net_tx_pps", 0) or 0
+        process_count = pt.get("process_count", 0) or 0
+        process_rss = pt.get("process_rss_gb", 0) or 0
 
         if cpu > 80.0: is_anomaly = True
         if slow_q > 0.1: is_anomaly = True
@@ -888,6 +1022,18 @@ def process_telemetry_for_ai(metrics_history):
             avg_tx = summary_stats["net_tx_mb_s"]["avg"]
             sd_tx = summary_stats["net_tx_mb_s"]["std_dev"]
             if net_tx_mb > (avg_tx + 2.5 * sd_tx) and net_tx_mb > 10.0:
+                is_anomaly = True
+
+        if summary_stats.get("process_count"):
+            avg_procs = summary_stats["process_count"]["avg"]
+            sd_procs = summary_stats["process_count"]["std_dev"]
+            if process_count > (avg_procs + 2 * sd_procs) and process_count > 20:
+                is_anomaly = True
+
+        if summary_stats.get("process_rss_gb"):
+            avg_rss = summary_stats["process_rss_gb"]["avg"]
+            sd_rss = summary_stats["process_rss_gb"]["std_dev"]
+            if process_rss > (avg_rss + 2 * sd_rss) and process_rss > 1.0:
                 is_anomaly = True
 
         if is_anomaly:
@@ -977,6 +1123,7 @@ if __name__ == "__main__":
     # 1. Collect data
     metrics_history = fetch_prometheus_metrics(session, start_time, end_time, args.step)
     top_queries = fetch_qan_queries(session, pmm_major, start_time, end_time)
+    top_process_groups = fetch_top_process_groups(session, start_time, end_time)
 
     if not metrics_history:
         print("❌ No Prometheus metrics were found. Check PMM_URL and the password.", file=sys.stderr)
@@ -991,7 +1138,8 @@ if __name__ == "__main__":
         "system_metrics_timeline": [
             {"t": ts, **metrics} for ts, metrics in sorted(metrics_history.items())
         ],
-        "top_problematic_sql_queries": top_queries
+        "top_problematic_sql_queries": top_queries,
+        "top_process_groups": top_process_groups,
     }
     
     try:
@@ -1011,18 +1159,19 @@ if __name__ == "__main__":
         "analyzed_period": period_label,
         "period_summary": summary_stats,
         "anomalies_and_spikes_timeline": anomaly_timeline,
-        "top_problematic_sql_queries": top_queries
+        "top_problematic_sql_queries": top_queries,
+        "top_process_groups": top_process_groups,
     }
 
     # 4. Prepare the prompt
     system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
 Analyze the provided PMM telemetry data for the period {period_label}.
-Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS), as well as the top slow SQL queries from Query Analytics (QAN).
+Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS, process count and process RSS from process-exporter), the top process groups by memory/count, and the top slow SQL queries from Query Analytics (QAN).
 
 Produce a detailed Root Cause Analysis:
-1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks in CPU, Load, Swap, Disk I/O, Network Throughput/PPS or Slow Queries in the anomaly timeline?
+1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks in CPU, Load, Swap, Disk I/O, Network Throughput/PPS, Process count/RSS or Slow Queries in the anomaly timeline?
 2. CHRONOLOGICAL CORRELATION: Which resource starts degrading FIRST and how does that affect the others (e.g. a spike in Network Packets/MBs -> overload of MySQL threads -> high CPU/RAM consumption)?
-3. CORRELATION WITH SQL QUERIES: Which of the provided SQL queries coincide with these peaks and are likely causing high resource consumption (e.g. missing indexes, scanning many rows `total_rows_examined`, or transferring large volumes of data over the network). For each query, name the database (`database` / `databases`) and the instance (`service_names`).
+3. CORRELATION WITH SQL QUERIES AND PROCESSES: Which of the provided SQL queries or process groups (`top_process_groups`) coincide with these peaks and are likely causing high resource consumption (e.g. missing indexes, scanning many rows `total_rows_examined`, a process group with high `rss_gb` or `process_count`)? For each query, name the database (`database` / `databases`) and the instance (`service_names`). For each process group, name `groupname` and `node_name`.
 4. ROOT CAUSE HYPOTHESIS: Describe the full problem chain (e.g. 'Network flood / Large SELECT query -> Disk Read saturation -> Network TX saturation -> Swap thrashing -> Locking of MySQL threads').
 5. REMEDIATION RECOMMENDATIONS: Give concrete steps for:
    - SQL query optimization (indexes, rewriting).
@@ -1037,7 +1186,7 @@ Produce a detailed Root Cause Analysis:
     # Full user prompt, including the JSON payload for the API
     full_user_prompt_with_json = f"""Please analyze the provided Percona Monitoring and Management (PMM) telemetry data for the period {period_label} and produce a Root Cause Analysis.
 
-Here is the structured data for anomalies, overall statistics for the period, and the top problematic SQL queries:
+Here is the structured data for anomalies, overall statistics for the period, top process groups, and the top problematic SQL queries:
 
 ```json
 {json.dumps(ai_payload, indent=2, ensure_ascii=False)}
