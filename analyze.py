@@ -1165,7 +1165,7 @@ if __name__ == "__main__":
 
     # 4. Prepare the prompt
     system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
-Analyze the provided PMM telemetry data for the period {period_label}.
+Analyze the provided PMM telemetry data from the given date and time range.
 Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS, process count and process RSS from process-exporter), the top process groups by memory/count, and the top slow SQL queries from Query Analytics (QAN).
 
 Produce a detailed Root Cause Analysis:
