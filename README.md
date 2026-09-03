@@ -1,6 +1,6 @@
 # Analyze PMM metrics with AI
 
-## Get metrics by script
+## Get metrics
 
 This script scrapes the metrics locally and normalizes data to reduce cost of the ai analysis.
 
