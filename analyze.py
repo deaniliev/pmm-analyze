@@ -482,6 +482,9 @@ def fetch_clickhouse_queries_via_docker(start_time, end_time):
     SELECT 
         fingerprint AS query_signature,
         any(example) AS sample_sql,
+        groupUniqArray(schema) AS schemas,
+        groupUniqArray(database) AS databases,
+        groupUniqArray(service_name) AS service_names,
         sum(m_query_time_cnt) AS total_executions,
         round(sum(m_query_time_sum) / sum(m_query_time_cnt), 4) AS avg_latency_sec,
         round(max(m_query_time_max), 2) AS max_latency_sec,
@@ -512,7 +515,7 @@ def fetch_clickhouse_queries_via_docker(start_time, end_time):
         )
         stdout_text = result.stdout.decode('utf-8')
         data = json.loads(stdout_text)
-        queries = data.get('data', [])
+        queries = attach_query_databases(data.get('data', []))
         print(f"✅ Успешно извлечени {len(queries)} бавни SQL заявки.")
         return queries
     except subprocess.CalledProcessError as e:
@@ -522,6 +525,35 @@ def fetch_clickhouse_queries_via_docker(start_time, end_time):
         print(f"❌ Грешка при парсване на ClickHouse JSON: {e}", file=sys.stderr)
         
     return []
+
+
+def _nonempty_unique(values):
+    seen = []
+    for value in values or []:
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def attach_query_databases(queries):
+    """Добавя към всяка заявка базата/схемата, в която е наблюдавана.
+
+    В PMM ClickHouse `schema` е MySQL базата (и PostgreSQL схемата), а
+    `database` е PostgreSQL базата/каталогът. Един fingerprint може да се
+    среща в повече от една база, затова се пази списък.
+    """
+    for query in queries:
+        schemas = _nonempty_unique(query.pop("schemas", None))
+        pg_databases = _nonempty_unique(query.pop("databases", None))
+        service_names = _nonempty_unique(query.get("service_names"))
+
+        query["service_names"] = service_names
+        # MySQL: schema държи името на базата; PostgreSQL: database е каталогът.
+        query["databases"] = pg_databases or schemas
+        if schemas and pg_databases:
+            query["schemas"] = schemas
+        query["database"] = query["databases"][0] if query["databases"] else ""
+    return queries
 
 # ==========================================
 # 6. ФИЛТРИРАНЕ НА АНОМАЛИИ И СМАЛЯВАНЕ НА ДАННИТЕ
@@ -717,7 +749,7 @@ if __name__ == "__main__":
 Направи подробен Root Cause Analysis:
 1. ИДЕНТИФИКАЦИЯ НА МОДЕЛИ И ПИКОВЕ: Кога са основните пикове в CPU, Load, Swap, Disk I/O, Network Throughput/PPS или Slow Queries в аномалната хронология?
 2. ХРОНОЛОГИЧНА КОРЕЛАЦИЯ: Кой ресурс започва да деградира ПЪРВИ и как това влияе на останалите (напр. пик в Network Packets/MBs -> претоварване на MySQL нишки -> висока консумация на CPU/RAM)?
-3. КОРЕЛАЦИЯ СЪС SQL ЗАЯВКИ: Кои от предоставените SQL заявки съвпадат с тези пикове и вероятно причиняват висока консумация на ресурси (напр. липса на индекси, сканиране на много редове `total_rows_examined` или прехвърляне на големи обем данни по мрежата).
+3. КОРЕЛАЦИЯ СЪС SQL ЗАЯВКИ: Кои от предоставените SQL заявки съвпадат с тези пикове и вероятно причиняват висока консумация на ресурси (напр. липса на индекси, сканиране на много редове `total_rows_examined` или прехвърляне на големи обем данни по мрежата). За всяка заявка посочи базата данни (`database` / `databases`) и инстанцията (`service_names`).
 4. ПЪРВОПРИЧИНА (Root Cause Hypothesis): Опиши пълната верига на проблема (напр. 'Network flood / Голяма SELECT заявка -> Disk Read saturation -> Network TX saturation -> Swap thrashing -> Locking на MySQL нишки').
 5. ПРЕПОРЪКИ ЗА РЕШЕНИЕ: Дай конкретни стъпки за:
    - Оптимизация на SQL заявките (индекси, преписване).
