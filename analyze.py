@@ -10,12 +10,12 @@ import math
 import importlib.util
 from datetime import datetime, timedelta
 
-# Игнориране на предупрежденията за самоподписан SSL сертификат (InsecureRequestWarning)
+# Ignore warnings about a self-signed SSL certificate (InsecureRequestWarning)
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 1. ДЕФОЛТНИ СТОЙНОСТИ
+# 1. DEFAULT VALUES
 # ==========================================
 PMM_CONTAINER_NAME = "pmm-server"
 PMM_URL = "https://localhost:8443"
@@ -28,27 +28,27 @@ CLICKHOUSE_PASS = "clickhouse"
 USE_AI = False
 AI_API_KEY = "your_api_key_here"
 
-# Празно означава "генерирай име на файл според избрания период"
+# Empty means "generate a file name from the selected period"
 OUTPUT_DATA_FILE = ""
 
-# Времеви прозорец: START/END са конкретни дати, LAST е относителен период (напр. 3d, 12h, 90m)
+# Time window: START/END are specific dates, LAST is a relative period (e.g. 3d, 12h, 90m)
 START_TIME = ""
 END_TIME = ""
 LAST_PERIOD = "3d"
-STEP = "300s"  # 5 минути (300 секунди)
+STEP = "300s"  # 5 minutes (300 seconds)
 
 # ==========================================
-# 2. ЗАРЕЖДАНЕ НА КОНФИГУРАЦИЯ ОТ ФАЙЛОВЕ
+# 2. LOADING CONFIGURATION FROM FILES
 # ==========================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class ConfigError(Exception):
-    """Липсващ или нечетим конфигурационен файл."""
+    """Missing or unreadable configuration file."""
 
 
 def default_config_candidates():
-    """Местата, където се търси .env, когато не е зададен --config."""
+    """Locations searched for .env when --config is not set."""
     candidates = [os.path.abspath(".env")]
     script_env = os.path.join(SCRIPT_DIR, ".env")
     if script_env not in candidates:
@@ -61,8 +61,8 @@ def resolve_config_file(explicit_path):
         path = os.path.abspath(os.path.expanduser(explicit_path))
         if not os.path.isfile(path):
             raise ConfigError(
-                f"⚠️ Зададеният конфигурационен файл не е намерен: {explicit_path}\n"
-                f"   Търсено в: {path}"
+                f"⚠️ The specified configuration file was not found: {explicit_path}\n"
+                f"   Looked in: {path}"
             )
         return path
 
@@ -73,9 +73,9 @@ def resolve_config_file(explicit_path):
 
     tried = "\n".join(f"   - {path}" for path in candidates)
     raise ConfigError(
-        "❌ Не е намерен .env файл. Проверени места:\n"
+        "❌ No .env file found. Checked locations:\n"
         f"{tried}\n"
-        "   Създайте .env по образец на .env.example или посочете друг файл с --config."
+        "   Create a .env from .env.example or pass another file with --config."
     )
 
 
@@ -83,7 +83,7 @@ def load_env_file(path):
     try:
         from dotenv import load_dotenv
     except ImportError:
-        # Резервен парсер, когато python-dotenv не е инсталиран
+        # Fallback parser when python-dotenv is not installed
         try:
             values = {}
             with open(path, "r", encoding="utf-8") as f:
@@ -93,9 +93,9 @@ def load_env_file(path):
                         key, val = line.split("=", 1)
                         values[key.strip()] = val.strip().strip("'\"")
         except OSError as e:
-            raise ConfigError(f"❌ Конфигурационният файл не може да бъде прочетен: {e}")
+            raise ConfigError(f"❌ The configuration file cannot be read: {e}")
 
-        # setdefault: реалната среда има приоритет над файла, както при python-dotenv
+        # setdefault: the real environment takes priority over the file, as with python-dotenv
         for key, val in values.items():
             os.environ.setdefault(key, val)
     else:
@@ -156,16 +156,16 @@ def apply_env_py(env_py_path):
         LAST_PERIOD = getattr(custom_env, "LAST_PERIOD", LAST_PERIOD)
         STEP = getattr(custom_env, "STEP", STEP)
 
-        print("ℹ️  Конфигурацията е допълнена от env.py", file=sys.stderr)
+        print("ℹ️  Configuration was supplemented from env.py", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️ Грешка при зареждане на env.py: {e}", file=sys.stderr)
+        print(f"⚠️ Error loading env.py: {e}", file=sys.stderr)
 
 
 def load_config(explicit_path):
-    """Зарежда конфигурацията и връща пътя на използвания файл."""
+    """Load configuration and return the path of the file used."""
     if not explicit_path:
         print(
-            "ℹ️  Не е зададен --config, търси се .env по подразбиране.",
+            "ℹ️  --config was not set, looking for .env by default.",
             file=sys.stderr,
         )
 
@@ -176,9 +176,9 @@ def load_config(explicit_path):
     env_py_path = os.path.join(SCRIPT_DIR, "env.py")
     if os.path.exists(env_py_path):
         if explicit_path:
-            # Иначе env.py би подменил изрично избраната конфигурация
+            # Otherwise env.py would override the explicitly selected configuration
             print(
-                f"ℹ️  env.py е пропуснат заради --config {explicit_path}",
+                f"ℹ️  env.py skipped because of --config {explicit_path}",
                 file=sys.stderr,
             )
         else:
@@ -188,14 +188,14 @@ def load_config(explicit_path):
 
 
 def parse_config_arg(argv):
-    """Изважда --config преди основния парсер, защото от него зависят стойностите по подразбиране."""
+    """Extract --config before the main parser, because default values depend on it."""
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config")
     known_args, _ = pre_parser.parse_known_args(argv)
     return known_args.config
 
 # ==========================================
-# 3. НАСТРОЙКИ НА ВРЕМЕВИ ПРОЗОРЕЦ И ЗАЯВКИ
+# 3. TIME WINDOW AND QUERY SETTINGS
 # ==========================================
 DATETIME_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
@@ -224,9 +224,9 @@ def parse_datetime(value, option_name):
             continue
 
     raise ValueError(
-        f"Невалидна дата за {option_name}: '{value}'. "
-        "Позволени формати: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD HH:MM:SS', "
-        "UNIX timestamp или 'now'."
+        f"Invalid date for {option_name}: '{value}'. "
+        "Allowed formats: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD HH:MM:SS', "
+        "UNIX timestamp or 'now'."
     )
 
 
@@ -235,19 +235,19 @@ def parse_duration(value, option_name):
     match = re.fullmatch(r"(\d+)\s*([mhdw])", value)
     if not match:
         raise ValueError(
-            f"Невалиден период за {option_name}: '{value}'. "
-            "Позволени формати: 90m, 12h, 3d, 2w."
+            f"Invalid period for {option_name}: '{value}'. "
+            "Allowed formats: 90m, 12h, 3d, 2w."
         )
 
     amount, unit = int(match.group(1)), match.group(2)
     if amount <= 0:
-        raise ValueError(f"Периодът за {option_name} трябва да е по-голям от нула.")
+        raise ValueError(f"The period for {option_name} must be greater than zero.")
 
     return timedelta(**{DURATION_UNITS[unit]: amount})
 
 
 def resolve_time_window(start_value, end_value, last_value):
-    """CLI/env стойностите се превръщат в конкретни начало и край на прозореца."""
+    """Turn CLI/env values into a concrete start and end of the window."""
     start = parse_datetime(start_value, "--start") if start_value else None
     end = parse_datetime(end_value, "--end") if end_value else None
 
@@ -261,7 +261,7 @@ def resolve_time_window(start_value, end_value, last_value):
 
     if start >= end:
         raise ValueError(
-            f"Началната дата ({start:%Y-%m-%d %H:%M}) трябва да е преди крайната "
+            f"The start date ({start:%Y-%m-%d %H:%M}) must be before the end date "
             f"({end:%Y-%m-%d %H:%M})."
         )
 
@@ -272,129 +272,130 @@ def parse_step_seconds(value):
     match = re.fullmatch(r"(\d+)\s*([smhd]?)", str(value).strip().lower())
     if not match:
         raise ValueError(
-            f"Невалидна стъпка за --step: '{value}'. Позволени формати: 30s, 300s, 5m, 1h."
+            f"Invalid step for --step: '{value}'. Allowed formats: 30s, 300s, 5m, 1h."
         )
 
     amount = int(match.group(1))
     multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
     seconds = amount * multiplier
     if seconds <= 0:
-        raise ValueError("Стъпката за --step трябва да е по-голяма от нула.")
+        raise ValueError("The --step interval must be greater than zero.")
 
     return seconds
 
 
 def format_period(start, end):
     hours = (end - start).total_seconds() / 3600
-    length = f"{hours / 24:.1f} дни" if hours >= 48 else f"{hours:.1f} часа"
+    length = f"{hours / 24:.1f} days" if hours >= 48 else f"{hours:.1f} hours"
     return f"{start:%Y-%m-%d %H:%M} - {end:%Y-%m-%d %H:%M} ({length})"
 
 
 HELP_EPILOG = """
-ИЗБОР НА ВРЕМЕВИ ПЕРИОД
-  Периодът се определя от комбинацията на --start, --end и --last:
+CHOOSING A TIME PERIOD
+  The period is determined by the combination of --start, --end and --last:
 
-    --start и --end        точният период между двете дати
-    само --start           от началната дата до текущия момент
-    само --end             период с дължина --last, завършващ на тази дата
-    без --start и --end    последните --last (по подразбиране 3d) до сега
+    --start and --end      the exact period between the two dates
+    --start only           from the start date until now
+    --end only             a period of length --last ending at that date
+    neither --start nor --end
+                           the last --last (default 3d) until now
 
-  Дати за --start и --end се приемат в следните формати:
+  Dates for --start and --end accept the following formats:
 
-    2026-08-10             00:00 ч. на тази дата
-    '2026-08-10 14:30'     дата и час (кавичките са нужни заради интервала)
-    2026-08-10T14:30:00    ISO формат, работи и без кавички
+    2026-08-10             00:00 on that date
+    '2026-08-10 14:30'     date and time (quotes are required because of the space)
+    2026-08-10T14:30:00    ISO format, works without quotes
     1755000000             UNIX timestamp
-    now                    текущият момент
+    now                    the current moment
 
-  Продължителност за --last: 90m, 12h, 3d, 2w (минути, часове, дни, седмици).
+  Duration for --last: 90m, 12h, 3d, 2w (minutes, hours, days, weeks).
 
-ПРИМЕРИ
+EXAMPLES
   python3 analyze.py
-      последните 3 дни (поведението по подразбиране)
+      last 3 days (the default)
 
   python3 analyze.py --last 12h
-      последните 12 часа
+      last 12 hours
 
   python3 analyze.py --start '2026-08-10' --end '2026-08-12 18:00'
-      точен период, например докато е продължавал инцидент
+      exact period, for example while an incident lasted
 
   python3 analyze.py --start '2026-08-10 09:00'
-      от този момент до сега
+      from that moment until now
 
   python3 analyze.py --end '2026-08-12 18:00' --last 6h
-      6 часа преди даден момент, за да се види какво е довело до него
+      6 hours before a given moment, to see what led up to it
 
   python3 analyze.py --last 2w --step 20m
-      дълъг период с по-груба стъпка (виж бележката по-долу)
+      a long period with a coarser step (see the note below)
 
-КОНФИГУРАЦИЯ
-  Без --config се използва .env от текущата директория, а ако липсва там - .env
-  до самия скрипт. Ако не бъде намерен нито един, скриптът спира с грешка.
+CONFIGURATION
+  Without --config, .env from the current directory is used, and if it is missing
+  there, .env next to the script. If neither is found, the script exits with an error.
 
-  С --config се посочва конкретен файл, което е удобно при няколко PMM
-  инсталации на един хост:
+  --config points at a specific file, which is handy when one host runs several PMM
+  installations:
 
     python3 analyze.py --config ./.env-customer1
     python3 analyze.py --config /root/.env-customer2 --last 12h
 
-  Файлът има формата на .env.example. Когато е зададен --config, евентуален
-  env.py до скрипта се пропуска, за да не подмени избраната конфигурация.
+  The file has the same format as .env.example. When --config is set, an env.py
+  sitting next to the script is skipped so it cannot override the selected
+  configuration.
 
-ЗАБЕЛЕЖКИ
-  Prometheus връща максимум 11000 точки на заявка, затова дълъг период изисква
-  по-голяма стъпка. Скриптът проверява това предварително и предлага стойност
-  за --step, вместо да оставя заявките да се провалят.
+NOTES
+  Prometheus returns at most 11000 points per query, so a long period needs a
+  larger step. The script checks this up front and suggests a --step value
+  instead of letting the queries fail.
 
-  Стойностите по подразбиране може да се зададат и в конфигурационния файл чрез
-  START_TIME, END_TIME, LAST_PERIOD, STEP и OUTPUT_DATA_FILE. Аргументите от
-  командния ред имат приоритет.
+  Defaults can also be set in the configuration file via START_TIME, END_TIME,
+  LAST_PERIOD, STEP and OUTPUT_DATA_FILE. Command-line arguments take priority.
 """
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Извлича PMM телеметрия за избран период, филтрира аномалиите и подготвя "
-            "данните за AI анализ."
+            "Fetch PMM telemetry for a chosen period, filter anomalies and prepare "
+            "the data for AI analysis."
         ),
         epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config",
-        metavar="ФАЙЛ",
-        help="Конфигурационен файл (по подразбиране: .env в текущата директория или до скрипта).",
+        metavar="FILE",
+        help="Configuration file (default: .env in the current directory or next to the script).",
     )
     parser.add_argument(
         "--start",
-        metavar="ДАТА",
+        metavar="DATE",
         default=START_TIME,
-        help="Начало на периода. Виж форматите по-долу.",
+        help="Start of the period. See the formats below.",
     )
     parser.add_argument(
         "--end",
-        metavar="ДАТА",
+        metavar="DATE",
         default=END_TIME,
-        help="Край на периода (по подразбиране: текущият момент).",
+        help="End of the period (default: the current moment).",
     )
     parser.add_argument(
         "--last",
-        metavar="ПЕРИОД",
+        metavar="PERIOD",
         default=LAST_PERIOD,
-        help=f"Период назад от края, когато не е зададено --start (по подразбиране: {LAST_PERIOD}).",
+        help=f"Period back from the end when --start is not set (default: {LAST_PERIOD}).",
     )
     parser.add_argument(
         "--step",
-        metavar="СТЪПКА",
+        metavar="STEP",
         default=STEP,
-        help=f"Стъпка на извадката за Prometheus (по подразбиране: {STEP}).",
+        help=f"Prometheus sample step (default: {STEP}).",
     )
     parser.add_argument(
         "--output",
-        metavar="ФАЙЛ",
+        metavar="FILE",
         default=OUTPUT_DATA_FILE,
-        help="Файл за суровите данни (по подразбиране: име, генерирано от периода).",
+        help="File for the raw data (default: a name generated from the period).",
     )
     return parser.parse_args()
 
@@ -408,11 +409,11 @@ PROMETHEUS_QUERIES = {
     "disk_write_mb_s": 'sum(rate(node_disk_written_bytes_total[5m])) / 1024 / 1024',
     "disk_free_gb": 'node_filesystem_free_bytes{mountpoint="/"}/ 1024 / 1024 / 1024',
     
-    # Мрежова пропускателна способност (Network Throughput - MB/s)
+    # Network throughput (MB/s)
     "net_rx_mb_s": 'sum(rate(node_network_receive_bytes_total{device!="lo"}[5m])) / 1024 / 1024',
     "net_tx_mb_s": 'sum(rate(node_network_transmit_bytes_total{device!="lo"}[5m])) / 1024 / 1024',
     
-    # Пакети в секунда (Network Packets Per Second - PPS)
+    # Network packets per second (PPS)
     "net_rx_pps": 'sum(rate(node_network_receive_packets_total{device!="lo"}[5m]))',
     "net_tx_pps": 'sum(rate(node_network_transmit_packets_total{device!="lo"}[5m]))',
 
@@ -423,10 +424,10 @@ PROMETHEUS_QUERIES = {
 }
 
 # ==========================================
-# 4. ИЗВЛИЧАНЕ НА МЕТРИКИ ОТ PROMETHEUS API
+# 4. FETCHING METRICS FROM THE PROMETHEUS API
 # ==========================================
 def fetch_prometheus_metrics(start_time, end_time, step):
-    print(f"⏳ Извличане на Prometheus метрики през PMM API (стъпка {step})...")
+    print(f"⏳ Fetching Prometheus metrics via the PMM API (step {step})...")
     time_series_data = {}
     
     session = requests.Session()
@@ -445,9 +446,9 @@ def fetch_prometheus_metrics(start_time, end_time, step):
             r = session.get(url, params=params, timeout=30)
             
             if r.status_code != 200:
-                print(f"⚠️ HTTP {r.status_code} при {metric_name}.", file=sys.stderr)
+                print(f"⚠️ HTTP {r.status_code} for {metric_name}.", file=sys.stderr)
                 if r.status_code in (401, 403):
-                    print("   👉 Грешка с автентикацията! Проверете PMM_USER и PMM_PASS.", file=sys.stderr)
+                    print("   👉 Authentication error! Check PMM_USER and PMM_PASS.", file=sys.stderr)
                     break
                 continue
 
@@ -468,15 +469,15 @@ def fetch_prometheus_metrics(start_time, end_time, step):
                     except ValueError:
                         time_series_data[time_str][metric_name] = None
         except Exception as e:
-            print(f"⚠️ Грешка при метрика {metric_name}: {e}", file=sys.stderr)
+            print(f"⚠️ Error fetching metric {metric_name}: {e}", file=sys.stderr)
             
     return time_series_data
 
 # ==========================================
-# 5. ИЗВЛИЧАНЕ НА SQL ЗАЯВКИ ЧРЕЗ DOCKER EXEC
+# 5. FETCHING SQL QUERIES VIA DOCKER EXEC
 # ==========================================
 def fetch_clickhouse_queries_via_docker(start_time, end_time):
-    print("⏳ Извличане на бавни SQL заявки от ClickHouse през `docker exec`...")
+    print("⏳ Fetching slow SQL queries from ClickHouse via `docker exec`...")
     
     clickhouse_sql = f"""
     SELECT 
@@ -516,13 +517,13 @@ def fetch_clickhouse_queries_via_docker(start_time, end_time):
         stdout_text = result.stdout.decode('utf-8')
         data = json.loads(stdout_text)
         queries = attach_query_databases(data.get('data', []))
-        print(f"✅ Успешно извлечени {len(queries)} бавни SQL заявки.")
+        print(f"✅ Successfully fetched {len(queries)} slow SQL queries.")
         return queries
     except subprocess.CalledProcessError as e:
         err_msg = e.stderr.decode('utf-8').strip() if e.stderr else str(e)
-        print(f"❌ Грешка при извличане на ClickHouse заявки през Docker: {err_msg}", file=sys.stderr)
+        print(f"❌ Error fetching ClickHouse queries via Docker: {err_msg}", file=sys.stderr)
     except Exception as e:
-        print(f"❌ Грешка при парсване на ClickHouse JSON: {e}", file=sys.stderr)
+        print(f"❌ Error parsing ClickHouse JSON: {e}", file=sys.stderr)
         
     return []
 
@@ -536,11 +537,11 @@ def _nonempty_unique(values):
 
 
 def attach_query_databases(queries):
-    """Добавя към всяка заявка базата/схемата, в която е наблюдавана.
+    """Attach the database/schema each query was observed in.
 
-    В PMM ClickHouse `schema` е MySQL базата (и PostgreSQL схемата), а
-    `database` е PostgreSQL базата/каталогът. Един fingerprint може да се
-    среща в повече от една база, затова се пази списък.
+    In PMM ClickHouse, `schema` is the MySQL database (and the PostgreSQL schema),
+    while `database` is the PostgreSQL database/catalog. One fingerprint can
+    appear in more than one database, so a list is kept.
     """
     for query in queries:
         schemas = _nonempty_unique(query.pop("schemas", None))
@@ -548,7 +549,7 @@ def attach_query_databases(queries):
         service_names = _nonempty_unique(query.get("service_names"))
 
         query["service_names"] = service_names
-        # MySQL: schema държи името на базата; PostgreSQL: database е каталогът.
+        # MySQL: schema holds the database name; PostgreSQL: database is the catalog.
         query["databases"] = pg_databases or schemas
         if schemas and pg_databases:
             query["schemas"] = schemas
@@ -556,7 +557,7 @@ def attach_query_databases(queries):
     return queries
 
 # ==========================================
-# 6. ФИЛТРИРАНЕ НА АНОМАЛИИ И СМАЛЯВАНЕ НА ДАННИТЕ
+# 6. FILTERING ANOMALIES AND REDUCING THE DATA
 # ==========================================
 def process_telemetry_for_ai(metrics_history):
     timeline = [{"t": ts, **metrics} for ts, metrics in sorted(metrics_history.items())]
@@ -633,15 +634,15 @@ def process_telemetry_for_ai(metrics_history):
     return summary_stats, filtered_timeline
 
 # ==========================================
-# 7. AI ROOT CAUSE АНАЛИЗ
+# 7. AI ROOT CAUSE ANALYSIS
 # ==========================================
 def analyze_with_ai(system_prompt, full_user_prompt_with_json):
-    print("\n🧠 Изпращане на оптимизирания пакет към AI за Root Cause анализ...", file=sys.stderr)
+    print("\n🧠 Sending the optimized payload to AI for Root Cause analysis...", file=sys.stderr)
     
     try:
         import openai
     except ImportError:
-        print("❌ Не е инсталирана `openai` библиотеката (`pip install openai`).", file=sys.stderr)
+        print("❌ The `openai` library is not installed (`pip install openai`).", file=sys.stderr)
         return None
 
     try:
@@ -656,19 +657,19 @@ def analyze_with_ai(system_prompt, full_user_prompt_with_json):
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"\n❌ Грешка при връзка с AI API: {e}", file=sys.stderr)
+        print(f"\n❌ Error connecting to the AI API: {e}", file=sys.stderr)
         return None
 
 # ==========================================
-# ОСНОВНО ИЗПЪЛНЕНИЕ
+# MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    # --config се обработва преди parse_args(), защото конфигурацията определя
-    # стойностите по подразбиране на останалите аргументи.
+    # --config is processed before parse_args() because configuration determines
+    # the default values of the remaining arguments.
     help_requested = any(arg in ("-h", "--help") for arg in sys.argv[1:])
     try:
         config_file = load_config(parse_config_arg(sys.argv[1:]))
-        print(f"ℹ️  Конфигурация: {config_file}", file=sys.stderr)
+        print(f"ℹ️  Configuration: {config_file}", file=sys.stderr)
     except ConfigError as e:
         if not help_requested:
             print(e, file=sys.stderr)
@@ -681,16 +682,16 @@ if __name__ == "__main__":
         step_seconds = parse_step_seconds(args.step)
     except ValueError as e:
         print(f"❌ {e}", file=sys.stderr)
-        print("   👉 Виж `python3 analyze.py --help` за избор на времеви период.", file=sys.stderr)
+        print("   👉 See `python3 analyze.py --help` for choosing a time period.", file=sys.stderr)
         sys.exit(2)
 
-    # Prometheus отказва query_range с повече от 11000 точки на заявка
+    # Prometheus rejects query_range with more than 11000 points per query
     points = (end_time - start_time).total_seconds() / step_seconds
     if points > 11000:
         suggested = math.ceil((end_time - start_time).total_seconds() / 11000 / 60) * 60
         print(
-            f"⚠️ Периодът дава {int(points)} точки при стъпка {args.step}, а Prometheus позволява "
-            f"максимум 11000. Използвайте --step {suggested}s или по-къс период.",
+            f"⚠️ The period produces {int(points)} points at step {args.step}, and Prometheus allows "
+            f"a maximum of 11000. Use --step {suggested}s or a shorter period.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -699,17 +700,17 @@ if __name__ == "__main__":
     output_file = args.output or (
         f"pmm_telemetry_{start_time:%Y%m%d-%H%M}_{end_time:%Y%m%d-%H%M}.json"
     )
-    print(f"🗓️  Анализиран период: {period_label}")
+    print(f"🗓️  Analyzed period: {period_label}")
 
-    # 1. Събиране на данни
+    # 1. Collect data
     metrics_history = fetch_prometheus_metrics(start_time, end_time, args.step)
     top_queries = fetch_clickhouse_queries_via_docker(start_time, end_time)
     
     if not metrics_history:
-        print("❌ Не бяха намерени метрики от Prometheus. Проверете PMM_URL и паролата.", file=sys.stderr)
+        print("❌ No Prometheus metrics were found. Check PMM_URL and the password.", file=sys.stderr)
         sys.exit(1)
         
-    # 2. Пълен payload за запазване във файл
+    # 2. Full payload to save to a file
     full_payload = {
         "period_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "period_end": end_time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -724,15 +725,15 @@ if __name__ == "__main__":
     try:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(full_payload, f, indent=2, ensure_ascii=False)
-        print(f"💾 Пълните сурови данни са запазени във файл: {output_file}")
+        print(f"💾 Full raw data saved to file: {output_file}")
     except Exception as e:
-        print(f"⚠️ Грешка при запис във файл {output_file}: {e}", file=sys.stderr)
+        print(f"⚠️ Error writing to file {output_file}: {e}", file=sys.stderr)
 
-    # 3. Филтриране за AI
+    # 3. Filter for AI
     summary_stats, anomaly_timeline = process_telemetry_for_ai(metrics_history)
     
     tokens_saved_pct = round((1 - (len(anomaly_timeline) / max(1, len(metrics_history)))) * 100, 1)
-    print(f"✅ Успешно филтрирани данни: от {len(metrics_history)} са оставени {len(anomaly_timeline)} критични точки ({tokens_saved_pct}% спестени токени).")
+    print(f"✅ Successfully filtered data: {len(anomaly_timeline)} critical points kept out of {len(metrics_history)} ({tokens_saved_pct}% tokens saved).")
 
     ai_payload = {
         "analyzed_period": period_label,
@@ -741,43 +742,43 @@ if __name__ == "__main__":
         "top_problematic_sql_queries": top_queries
     }
 
-    # 4. Подготовка на промпта
-    system_prompt = f"""Ти си главен Database Reliability Engineer (DBRE) и Linux Performance Expert.
-Анализирай предоставените PMM телеметрични данни за периода {period_label}.
-Забележка: Данните съдържат Общо статистическо резюме за целия период + хронологични отрязъци САМО за регистрираните пикове и аномалии (включително мрежов трафик MB/s и пакети/сек PPS), както и топ бавните SQL заявки от ClickHouse.
+    # 4. Prepare the prompt
+    system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
+Analyze the provided PMM telemetry data for the period {period_label}.
+Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS), as well as the top slow SQL queries from ClickHouse.
 
-Направи подробен Root Cause Analysis:
-1. ИДЕНТИФИКАЦИЯ НА МОДЕЛИ И ПИКОВЕ: Кога са основните пикове в CPU, Load, Swap, Disk I/O, Network Throughput/PPS или Slow Queries в аномалната хронология?
-2. ХРОНОЛОГИЧНА КОРЕЛАЦИЯ: Кой ресурс започва да деградира ПЪРВИ и как това влияе на останалите (напр. пик в Network Packets/MBs -> претоварване на MySQL нишки -> висока консумация на CPU/RAM)?
-3. КОРЕЛАЦИЯ СЪС SQL ЗАЯВКИ: Кои от предоставените SQL заявки съвпадат с тези пикове и вероятно причиняват висока консумация на ресурси (напр. липса на индекси, сканиране на много редове `total_rows_examined` или прехвърляне на големи обем данни по мрежата). За всяка заявка посочи базата данни (`database` / `databases`) и инстанцията (`service_names`).
-4. ПЪРВОПРИЧИНА (Root Cause Hypothesis): Опиши пълната верига на проблема (напр. 'Network flood / Голяма SELECT заявка -> Disk Read saturation -> Network TX saturation -> Swap thrashing -> Locking на MySQL нишки').
-5. ПРЕПОРЪКИ ЗА РЕШЕНИЕ: Дай конкретни стъпки за:
-   - Оптимизация на SQL заявките (индекси, преписване).
-   - Системни, Мрежови и MySQL настройки (innodb_buffer_pool_size, swappiness, max_connections, txqueuelen и др.)."""
+Produce a detailed Root Cause Analysis:
+1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks in CPU, Load, Swap, Disk I/O, Network Throughput/PPS or Slow Queries in the anomaly timeline?
+2. CHRONOLOGICAL CORRELATION: Which resource starts degrading FIRST and how does that affect the others (e.g. a spike in Network Packets/MBs -> overload of MySQL threads -> high CPU/RAM consumption)?
+3. CORRELATION WITH SQL QUERIES: Which of the provided SQL queries coincide with these peaks and are likely causing high resource consumption (e.g. missing indexes, scanning many rows `total_rows_examined`, or transferring large volumes of data over the network). For each query, name the database (`database` / `databases`) and the instance (`service_names`).
+4. ROOT CAUSE HYPOTHESIS: Describe the full problem chain (e.g. 'Network flood / Large SELECT query -> Disk Read saturation -> Network TX saturation -> Swap thrashing -> Locking of MySQL threads').
+5. REMEDIATION RECOMMENDATIONS: Give concrete steps for:
+   - SQL query optimization (indexes, rewriting).
+   - System, network and MySQL settings (innodb_buffer_pool_size, swappiness, max_connections, txqueuelen, etc.)."""
 
-    # Декларираме текстовата част за изход на конзолата
+    # Text shown on the console
     user_prompt_display = (
-        f"Период: {period_label}\n"
-        f"Размер на изпращаните данни: {len(anomaly_timeline)} точки (от общо {len(metrics_history)})."
+        f"Period: {period_label}\n"
+        f"Size of data being sent: {len(anomaly_timeline)} points (out of {len(metrics_history)} total)."
     )
 
-    # Декларираме пълния user_prompt, който съдържа и JSON payload-а за подаване към API-то
-    full_user_prompt_with_json = f"""Моля, анализирай предоставените телеметрични данни от Percona Monitoring and Management (PMM) за периода {period_label} и направи Root Cause Analysis.
+    # Full user prompt, including the JSON payload for the API
+    full_user_prompt_with_json = f"""Please analyze the provided Percona Monitoring and Management (PMM) telemetry data for the period {period_label} and produce a Root Cause Analysis.
 
-Ето структурираните данни за аномалии, обща статистика за периода и топ проблематични SQL заявки:
+Here is the structured data for anomalies, overall statistics for the period, and the top problematic SQL queries:
 
 ```json
 {json.dumps(ai_payload, indent=2, ensure_ascii=False)}
 ```"""
 
     print("\n" + "="*80)
-    print("                      ПРОМПТ ЗА AI АНАЛИЗ (ОПТИМИЗИРАН)                         ")
+    print("                      PROMPT FOR AI ANALYSIS (OPTIMIZED)                        ")
     print("="*80 + "\n")
     print(f"--- SYSTEM PROMPT ---\n{system_prompt}\n")
     print(f"--- USER PROMPT ---\n{user_prompt_display}")
     print("\n" + "="*80 + "\n")
 
-    # 5. Изпращане към AI
+    # 5. Send to AI
     if USE_AI:
         report = analyze_with_ai(system_prompt, full_user_prompt_with_json)
         if report:
@@ -786,4 +787,4 @@ if __name__ == "__main__":
             print("="*50 + "\n")
             print(report)
     else:
-        print("ℹ️  Флагът USE_AI = False. Пропуснато е автоматичното изпращане към API.", file=sys.stderr)
+        print("ℹ️  USE_AI = False. Automatic API submission skipped.", file=sys.stderr)
