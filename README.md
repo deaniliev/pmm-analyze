@@ -2,9 +2,9 @@
 
 ## Get metrics
 
-This script scrapes the metrics locally and normalizes data to reduce cost of the ai analysis.
+This script scrapes metrics over the PMM HTTP API and normalizes the data to reduce the cost of AI analysis. It detects PMM 2 vs PMM 3 and uses the matching Query Analytics endpoints, so Docker access to the PMM container is not required.
 
-**This script scrapes only the basic metrics: CPU usage, CPU load, RAM usage, SWAP usage, DISK usage (including reads/writes) and DIGESTED slow queries.**
+**This script scrapes only the basic metrics: CPU usage, CPU load, RAM usage, SWAP usage, DISK usage (including reads/writes), process-exporter process count and RSS, and DIGESTED slow queries.**
 
 How it works:
 
