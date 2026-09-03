@@ -4,7 +4,14 @@
 
 This script scrapes metrics over the PMM HTTP API and normalizes the data to reduce the cost of AI analysis. It detects PMM 2 vs PMM 3 and uses the matching Query Analytics endpoints, so Docker access to the PMM container is not required.
 
-**This script scrapes only the basic metrics: CPU usage, CPU load, RAM usage, SWAP usage, DISK usage (including reads/writes), process-exporter process count and RSS, and DIGESTED slow queries.**
+**This script scrapes system, network, MySQL/InnoDB and process-level metrics:**
+
+- **System**: CPU usage/load, CPU iowait % and steal % (VM noisy-neighbor signal), RAM, swap.
+- **Disk**: read/write throughput, %util, read/write latency (ms), free space (root and the lowest free % across all mounts).
+- **Network**: throughput (MB/s), packets/sec, plus rx/tx errors, drops, and TCP retransmit rate.
+- **MySQL/InnoDB**: slow queries, thread/connection counts and connection-used %, aborted connects, thread-cache misses, temp-tables-to-disk %, table lock waits, deadlocks, InnoDB buffer pool hit ratio, row lock waits/avg wait time, log writes, dirty page %.
+- **Processes**: process-exporter process count, RSS and swap, plus top process groups by memory/count.
+- **Slow queries**: DIGESTED slow queries from Query Analytics (QAN).
 
 How it works:
 

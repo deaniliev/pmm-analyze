@@ -393,19 +393,79 @@ PROMETHEUS_QUERIES = {
     "disk_read_mb_s": 'sum(rate(node_disk_read_bytes_total[5m])) / 1024 / 1024',
     "disk_write_mb_s": 'sum(rate(node_disk_written_bytes_total[5m])) / 1024 / 1024',
     "disk_free_gb": 'node_filesystem_free_bytes{mountpoint="/"}/ 1024 / 1024 / 1024',
-    
+
+    # Lowest free space % across all real (non-tmpfs/overlay) mounts, e.g. a separate MySQL data volume
+    "disk_free_min_pct": (
+        'min(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} '
+        '/ node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} * 100)'
+    ),
+
+    # CPU time spent waiting on I/O and stolen by the hypervisor (noisy-neighbor signal on VMs)
+    "cpu_iowait_pct": 'avg(rate(node_cpu_seconds_total{mode="iowait"}[5m])) * 100',
+    "cpu_steal_pct": 'avg(rate(node_cpu_seconds_total{mode="steal"}[5m])) * 100',
+
+    # Average time a disk spends busy servicing requests, and per-request latency
+    "disk_io_util_pct": 'avg(rate(node_disk_io_time_seconds_total[5m])) * 100',
+    "disk_read_latency_ms": (
+        'sum(rate(node_disk_read_time_seconds_total[5m])) '
+        '/ sum(rate(node_disk_reads_completed_total[5m])) * 1000'
+    ),
+    "disk_write_latency_ms": (
+        'sum(rate(node_disk_write_time_seconds_total[5m])) '
+        '/ sum(rate(node_disk_writes_completed_total[5m])) * 1000'
+    ),
+
     # Network throughput (MB/s)
     "net_rx_mb_s": 'sum(rate(node_network_receive_bytes_total{device!="lo"}[5m])) / 1024 / 1024',
     "net_tx_mb_s": 'sum(rate(node_network_transmit_bytes_total{device!="lo"}[5m])) / 1024 / 1024',
-    
+
     # Network packets per second (PPS)
     "net_rx_pps": 'sum(rate(node_network_receive_packets_total{device!="lo"}[5m]))',
     "net_tx_pps": 'sum(rate(node_network_transmit_packets_total{device!="lo"}[5m]))',
+
+    # Network errors/drops and TCP retransmits (real network trouble, not just "busy")
+    "net_rx_errors_rate": 'sum(rate(node_network_receive_errs_total{device!="lo"}[5m]))',
+    "net_tx_errors_rate": 'sum(rate(node_network_transmit_errs_total{device!="lo"}[5m]))',
+    "net_rx_drop_rate": 'sum(rate(node_network_receive_drop_total{device!="lo"}[5m]))',
+    "net_tx_drop_rate": 'sum(rate(node_network_transmit_drop_total{device!="lo"}[5m]))',
+    "tcp_retrans_rate": 'rate(node_netstat_Tcp_RetransSegs[5m])',
 
     "mysql_slow_queries_rate": 'rate(mysql_global_status_slow_queries[5m])',
     "mysql_active_threads": 'mysql_global_status_threads_running',
     "mysql_connected_threads": 'mysql_global_status_threads_connected',
     "mysql_queries_rate": 'rate(mysql_global_status_queries[5m])',
+
+    # Connection pressure and thread-cache efficiency
+    # `ignoring(job)`: status metrics are scraped at PMM's high-resolution interval, variables
+    # (like max_connections) at low-resolution, so they land under different `job` labels and
+    # would otherwise fail to vector-match.
+    "mysql_connections_used_pct": (
+        'mysql_global_status_max_used_connections '
+        '/ ignoring(job) mysql_global_variables_max_connections * 100'
+    ),
+    "mysql_aborted_connects_rate": 'rate(mysql_global_status_aborted_connects[5m])',
+    "mysql_threads_created_rate": 'rate(mysql_global_status_threads_created[5m])',
+
+    # Queries spilling to disk-based temp tables usually mean missing indexes / small sort/join buffers
+    "mysql_tmp_disk_tables_pct": (
+        'rate(mysql_global_status_created_tmp_disk_tables[5m]) '
+        '/ rate(mysql_global_status_created_tmp_tables[5m]) * 100'
+    ),
+    "mysql_deadlocks_rate": 'rate(mysql_global_status_innodb_deadlocks[5m])',
+    "mysql_table_locks_waited_rate": 'rate(mysql_global_status_table_locks_waited[5m])',
+
+    # InnoDB internals: buffer pool efficiency, row locking, redo log and dirty-page pressure
+    "innodb_buffer_pool_hit_ratio": (
+        '(1 - (rate(mysql_global_status_innodb_buffer_pool_reads[5m]) '
+        '/ rate(mysql_global_status_innodb_buffer_pool_read_requests[5m]))) * 100'
+    ),
+    "innodb_row_lock_waits_rate": 'rate(mysql_global_status_innodb_row_lock_waits[5m])',
+    "innodb_row_lock_time_avg_ms": 'mysql_global_status_innodb_row_lock_time_avg',
+    "innodb_log_writes_rate": 'rate(mysql_global_status_innodb_log_writes[5m])',
+    "innodb_buffer_pool_dirty_pages_pct": (
+        'mysql_global_status_innodb_buffer_pool_bytes_dirty '
+        '/ ignoring(job) mysql_global_variables_innodb_buffer_pool_size * 100'
+    ),
 
     # process-exporter (https://github.com/ncabatoff/process-exporter), scraped as a PMM external service
     "process_count": 'sum(namedprocess_namegroup_num_procs)',
@@ -998,13 +1058,44 @@ def process_telemetry_for_ai(metrics_history):
         process_count = pt.get("process_count", 0) or 0
         process_rss = pt.get("process_rss_gb", 0) or 0
 
+        cpu_iowait = pt.get("cpu_iowait_pct", 0) or 0
+        cpu_steal = pt.get("cpu_steal_pct", 0) or 0
+        disk_read_latency = pt.get("disk_read_latency_ms", 0) or 0
+        disk_write_latency = pt.get("disk_write_latency_ms", 0) or 0
+        disk_free_min_pct = pt.get("disk_free_min_pct", 100) or 100
+
+        net_rx_errors = pt.get("net_rx_errors_rate", 0) or 0
+        net_tx_errors = pt.get("net_tx_errors_rate", 0) or 0
+        net_rx_drop = pt.get("net_rx_drop_rate", 0) or 0
+        net_tx_drop = pt.get("net_tx_drop_rate", 0) or 0
+
+        mysql_conn_used_pct = pt.get("mysql_connections_used_pct", 0) or 0
+        mysql_aborted_connects = pt.get("mysql_aborted_connects_rate", 0) or 0
+        mysql_tmp_disk_pct = pt.get("mysql_tmp_disk_tables_pct", 0) or 0
+        mysql_deadlocks = pt.get("mysql_deadlocks_rate", 0) or 0
+        innodb_hit_ratio = pt.get("innodb_buffer_pool_hit_ratio", 100) or 100
+
         if cpu > 80.0: is_anomaly = True
         if slow_q > 0.1: is_anomaly = True
         if swap > 500.0: is_anomaly = True
         if ram_free < 1.0: is_anomaly = True
-        
+
         if net_rx_mb > 50.0 or net_tx_mb > 50.0: is_anomaly = True
         if net_rx_pps > 10000 or net_tx_pps > 10000: is_anomaly = True
+
+        if cpu_iowait > 20.0: is_anomaly = True
+        if cpu_steal > 10.0: is_anomaly = True
+        if disk_read_latency > 20.0 or disk_write_latency > 20.0: is_anomaly = True
+        if disk_free_min_pct < 10.0: is_anomaly = True
+
+        if net_rx_errors > 0 or net_tx_errors > 0: is_anomaly = True
+        if net_rx_drop > 0 or net_tx_drop > 0: is_anomaly = True
+
+        if mysql_conn_used_pct > 80.0: is_anomaly = True
+        if mysql_aborted_connects > 0.1: is_anomaly = True
+        if mysql_tmp_disk_pct > 25.0: is_anomaly = True
+        if mysql_deadlocks > 0: is_anomaly = True
+        if innodb_hit_ratio < 95.0: is_anomaly = True
 
         if summary_stats.get("load_1m"):
             avg_load = summary_stats["load_1m"]["avg"]
@@ -1034,6 +1125,20 @@ def process_telemetry_for_ai(metrics_history):
             avg_rss = summary_stats["process_rss_gb"]["avg"]
             sd_rss = summary_stats["process_rss_gb"]["std_dev"]
             if process_rss > (avg_rss + 2 * sd_rss) and process_rss > 1.0:
+                is_anomaly = True
+
+        tcp_retrans = pt.get("tcp_retrans_rate", 0) or 0
+        if summary_stats.get("tcp_retrans_rate"):
+            avg_retrans = summary_stats["tcp_retrans_rate"]["avg"]
+            sd_retrans = summary_stats["tcp_retrans_rate"]["std_dev"]
+            if tcp_retrans > (avg_retrans + 2.5 * sd_retrans) and tcp_retrans > 1.0:
+                is_anomaly = True
+
+        row_lock_waits = pt.get("innodb_row_lock_waits_rate", 0) or 0
+        if summary_stats.get("innodb_row_lock_waits_rate"):
+            avg_lock = summary_stats["innodb_row_lock_waits_rate"]["avg"]
+            sd_lock = summary_stats["innodb_row_lock_waits_rate"]["std_dev"]
+            if row_lock_waits > (avg_lock + 2 * sd_lock) and row_lock_waits > 0.1:
                 is_anomaly = True
 
         if is_anomaly:
@@ -1166,16 +1271,21 @@ if __name__ == "__main__":
     # 4. Prepare the prompt
     system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
 Analyze the provided PMM telemetry data from the given date and time range.
-Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies (including network traffic MB/s and packets/sec PPS, process count and process RSS from process-exporter), the top process groups by memory/count, and the top slow SQL queries from Query Analytics (QAN).
+Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies, the top process groups by memory/count, and the top slow SQL queries from Query Analytics (QAN). Metrics cover:
+  - System: CPU usage/load, CPU iowait % and steal % (VM noisy-neighbor signal), RAM/swap.
+  - Disk: read/write throughput, %util (`disk_io_util_pct`), read/write latency in ms, and lowest free-space % across all mounts (`disk_free_min_pct`).
+  - Network: throughput MB/s, packets/sec, plus rx/tx errors, drops, and TCP retransmit rate (real network faults, not just load).
+  - MySQL/InnoDB: slow queries, thread/connection counts, connection-used %, aborted connects, thread-cache misses (`mysql_threads_created_rate`), temp-tables-to-disk % (`mysql_tmp_disk_tables_pct`), table lock waits, deadlocks, InnoDB buffer pool hit ratio, row lock waits/avg wait time, log writes, and dirty page %.
+  - process-exporter: process count and RSS/swap.
 
 Produce a detailed Root Cause Analysis:
-1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks in CPU, Load, Swap, Disk I/O, Network Throughput/PPS, Process count/RSS or Slow Queries in the anomaly timeline?
-2. CHRONOLOGICAL CORRELATION: Which resource starts degrading FIRST and how does that affect the others (e.g. a spike in Network Packets/MBs -> overload of MySQL threads -> high CPU/RAM consumption)?
-3. CORRELATION WITH SQL QUERIES AND PROCESSES: Which of the provided SQL queries or process groups (`top_process_groups`) coincide with these peaks and are likely causing high resource consumption (e.g. missing indexes, scanning many rows `total_rows_examined`, a process group with high `rss_gb` or `process_count`)? For each query, name the database (`database` / `databases`) and the instance (`service_names`). For each process group, name `groupname` and `node_name`.
-4. ROOT CAUSE HYPOTHESIS: Describe the full problem chain (e.g. 'Network flood / Large SELECT query -> Disk Read saturation -> Network TX saturation -> Swap thrashing -> Locking of MySQL threads').
+1. IDENTIFY PATTERNS AND PEAKS: When are the main peaks/dips across CPU, Load, iowait/steal, Swap, Disk I/O throughput+latency, Network throughput/PPS/errors, InnoDB (lock waits, buffer pool hit ratio, deadlocks), connection pressure, or Slow Queries in the anomaly timeline?
+2. CHRONOLOGICAL CORRELATION: Which resource starts degrading FIRST and how does that affect the others (e.g. a spike in Network Packets/MBs -> overload of MySQL threads -> connections saturate -> row lock waits pile up -> high CPU/RAM; or disk latency rises -> buffer pool hit ratio drops -> slow queries -> lock waits)?
+3. CORRELATION WITH SQL QUERIES AND PROCESSES: Which of the provided SQL queries or process groups (`top_process_groups`) coincide with these peaks and are likely causing high resource consumption (e.g. missing indexes, scanning many rows `total_rows_examined`, temp tables spilling to disk, a process group with high `rss_gb` or `process_count`)? For each query, name the database (`database` / `databases`) and the instance (`service_names`). For each process group, name `groupname` and `node_name`.
+4. ROOT CAUSE HYPOTHESIS: Describe the full problem chain (e.g. 'Network flood / Large SELECT query -> Disk read latency spike -> InnoDB buffer pool hit ratio drops -> row lock waits -> connection pool exhaustion -> Swap thrashing').
 5. REMEDIATION RECOMMENDATIONS: Give concrete steps for:
-   - SQL query optimization (indexes, rewriting).
-   - System, network and MySQL settings (innodb_buffer_pool_size, swappiness, max_connections, txqueuelen, etc.)."""
+   - SQL query optimization (indexes, rewriting, avoiding disk temp tables).
+   - System, network and MySQL settings (innodb_buffer_pool_size, innodb_log_file_size, swappiness, max_connections, thread_cache_size, txqueuelen, etc.)."""
 
     # Text shown on the console
     user_prompt_display = (
