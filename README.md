@@ -74,3 +74,38 @@ Two related options:
 All four can also be set in `.env` as `START_TIME`, `END_TIME`, `LAST_PERIOD`, `STEP` and
 `OUTPUT_DATA_FILE`; command line arguments take precedence.
 
+
+## Selecting a server
+
+When PMM monitors several servers, analyze one of them with `--server` (alias `--node`).
+The value is the PMM node name, as shown in PMM's inventory and dashboards:
+
+```bash
+python3 analyze.py --list-servers                        # node names with data in the period
+python3 analyze.py --server mysql.example.com --last 12h
+python3 analyze.py --server mysql                        # short name, if it is unambiguous
+```
+
+With `--server`, everything is limited to that node: CPU, RAM, disk and network metrics,
+MySQL/InnoDB metrics, process-exporter groups, and the QAN slow queries and their examples.
+The node name is also written to the JSON (`node_name`), the AI prompt, and the default
+output file name, e.g. `pmm_telemetry_mysql.example.com_20260810-0000_20260812-1800.json`.
+
+The name is matched exactly, then case-insensitively, then by the short host name (the part
+before the first dot) in either direction. An unknown or ambiguous name stops the script and
+lists the available nodes.
+
+Without `--server` and with several nodes in PMM, the script prints a warning: the metrics of
+all servers are then mixed (for example `sum(...)` adds up all nodes) and are not meaningful
+for a root cause analysis.
+
+A default can be set in `.env` as `NODE_NAME`; `--server` takes precedence.
+
+How it works: PMM stores metrics in VictoriaMetrics, so the script passes
+`extra_label=node_name=<node>` with every Prometheus query, which applies the filter to every
+series in the expression, and sends `labels: [{key: node_name, value: [<node>]}]` to the QAN API
+(the same filter the QAN web UI uses). The QAN labels endpoint, which fills `service_names` of a
+query, has no such filter, so those names are limited to the node's services as reported by
+VictoriaMetrics.
+Before collecting, it checks that the backend honours the filter, and stops instead of
+returning mixed data if it does not.

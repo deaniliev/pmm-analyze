@@ -32,6 +32,9 @@ END_TIME = ""
 LAST_PERIOD = "3d"
 STEP = "300s"  # 5 minutes (300 seconds)
 
+# PMM node to analyze (the node_name label); empty means "everything PMM monitors"
+NODE_NAME = ""
+
 # ==========================================
 # 2. LOADING CONFIGURATION FROM FILES
 # ==========================================
@@ -100,7 +103,7 @@ def load_env_file(path):
 def apply_env_config():
     global PMM_URL, PMM_USER, PMM_PASS
     global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
-    global START_TIME, END_TIME, LAST_PERIOD, STEP
+    global START_TIME, END_TIME, LAST_PERIOD, STEP, NODE_NAME
 
     PMM_URL = os.getenv("PMM_URL", PMM_URL)
     PMM_USER = os.getenv("PMM_USER", PMM_USER)
@@ -115,12 +118,13 @@ def apply_env_config():
     END_TIME = os.getenv("END_TIME", END_TIME)
     LAST_PERIOD = os.getenv("LAST_PERIOD", LAST_PERIOD)
     STEP = os.getenv("STEP", STEP)
+    NODE_NAME = os.getenv("NODE_NAME", NODE_NAME)
 
 
 def apply_env_py(env_py_path):
     global PMM_URL, PMM_USER, PMM_PASS
     global USE_AI, AI_API_KEY, OUTPUT_DATA_FILE
-    global START_TIME, END_TIME, LAST_PERIOD, STEP
+    global START_TIME, END_TIME, LAST_PERIOD, STEP, NODE_NAME
 
     try:
         spec = importlib.util.spec_from_file_location("custom_env", env_py_path)
@@ -140,6 +144,7 @@ def apply_env_py(env_py_path):
         END_TIME = getattr(custom_env, "END_TIME", END_TIME)
         LAST_PERIOD = getattr(custom_env, "LAST_PERIOD", LAST_PERIOD)
         STEP = getattr(custom_env, "STEP", STEP)
+        NODE_NAME = getattr(custom_env, "NODE_NAME", NODE_NAME)
 
         print("ℹ️  Configuration was supplemented from env.py", file=sys.stderr)
     except Exception as e:
@@ -314,6 +319,19 @@ EXAMPLES
   python3 analyze.py --last 2w --step 20m
       a long period with a coarser step (see the note below)
 
+CHOOSING A SERVER
+  When PMM monitors several servers, pick one with --server (alias --node). The value
+  is the PMM node name, as shown in PMM's inventory and dashboards:
+
+    python3 analyze.py --server mysql.example.com --last 12h
+    python3 analyze.py --list-servers          # show the available node names
+
+  All metrics (CPU, RAM, disk, network, MySQL, process-exporter) and the QAN slow
+  queries are then limited to that node. A short name also works when it is
+  unambiguous: --server mysql matches the node mysql.example.com, and vice versa.
+  Without --server and with several nodes in PMM, the data of different servers is
+  mixed, and the script prints a warning.
+
 CONFIGURATION
   Without --config, .env from the current directory is used, and if it is missing
   there, .env next to the script. If neither is found, the script exits with an error.
@@ -334,7 +352,8 @@ NOTES
   instead of letting the queries fail.
 
   Defaults can also be set in the configuration file via START_TIME, END_TIME,
-  LAST_PERIOD, STEP and OUTPUT_DATA_FILE. Command-line arguments take priority.
+  LAST_PERIOD, STEP, NODE_NAME and OUTPUT_DATA_FILE. Command-line arguments take
+  priority.
 """
 
 
@@ -375,6 +394,23 @@ def parse_args():
         metavar="STEP",
         default=STEP,
         help=f"Prometheus sample step (default: {STEP}).",
+    )
+    parser.add_argument(
+        "--server",
+        "--node",
+        dest="server",
+        metavar="NODE",
+        default=NODE_NAME,
+        help=(
+            "Analyze only this PMM node (its node_name, e.g. mysql.example.com): "
+            "CPU/RAM/disk/network, MySQL, process-exporter and QAN. "
+            "Default: all nodes."
+        ),
+    )
+    parser.add_argument(
+        "--list-servers",
+        action="store_true",
+        help="Print the node names PMM has data for in the selected period and exit.",
     )
     parser.add_argument(
         "--output",
@@ -603,9 +639,106 @@ def detect_pmm_version(session):
 
 
 # ==========================================
+# 4a. SELECTING A NODE
+# ==========================================
+def node_extra_label(node_name):
+    """Query args that limit every series selector of a PromQL query to one node.
+
+    PMM stores metrics in VictoriaMetrics, which applies `extra_label` to all
+    selectors of the query, so PROMETHEUS_QUERIES need no per-node rewriting.
+    """
+    if not node_name:
+        return {}
+    return {"extra_label": f"node_name={node_name}"}
+
+
+def list_label_values(session, label, start_time, end_time, node_name=""):
+    """Values of a Prometheus label that have metrics in the window, sorted."""
+    response = session.get(
+        pmm_url(f"/prometheus/api/v1/label/{label}/values"),
+        params={
+            "start": int(start_time.timestamp()),
+            "end": int(end_time.timestamp()),
+            **node_extra_label(node_name),
+        },
+        timeout=PMM_REQUEST_TIMEOUT,
+    )
+    if response.status_code in (401, 403):
+        raise PmmApiError(
+            f"Authentication error while listing {label} values (HTTP {response.status_code}). "
+            "Check PMM_USER and PMM_PASS."
+        )
+    if response.status_code != 200:
+        raise PmmApiError(f"Listing {label} values returned HTTP {response.status_code}.")
+    try:
+        payload = response.json()
+    except ValueError as e:
+        raise PmmApiError(f"Listing {label} values returned invalid JSON: {e}") from e
+    if payload.get("status") != "success":
+        raise PmmApiError(f"Listing {label} values failed: {payload.get('error') or payload}")
+    return sorted(value for value in payload.get("data") or [] if value)
+
+
+def list_node_names(session, start_time, end_time):
+    """Node names that have metrics in the window, sorted."""
+    return list_label_values(session, "node_name", start_time, end_time)
+
+
+def _short_host(name):
+    return name.split(".", 1)[0].lower()
+
+
+def resolve_node_name(requested, available):
+    """Map the --server value to a PMM node name.
+
+    Tries an exact match, then a case-insensitive one, then a unique match on
+    the short host name (the part before the first dot) in either direction.
+    """
+    requested = requested.strip()
+    if requested in available:
+        return requested
+
+    matches = [name for name in available if name.lower() == requested.lower()]
+    if not matches:
+        matches = [name for name in available if _short_host(name) == _short_host(requested)]
+    if len(matches) == 1:
+        return matches[0]
+
+    if matches:
+        raise ValueError(
+            f"'{requested}' matches several PMM nodes: {', '.join(matches)}. "
+            "Use the full node name."
+        )
+    raise ValueError(
+        f"PMM has no metrics for a node named '{requested}' in the selected period.\n"
+        f"   Available nodes: {', '.join(available) if available else '(none)'}"
+    )
+
+
+def verify_node_filter(session, node_name, start_time, end_time):
+    """Make sure the backend honours extra_label, so other nodes cannot leak in."""
+    duration_s = max(int((end_time - start_time).total_seconds()), 60)
+    series = prometheus_instant_query(
+        session,
+        f"count by (node_name) (max_over_time(up[{duration_s}s]))",
+        end_time,
+        node_name,
+    )
+    leaked = sorted(
+        {s["metric"].get("node_name", "") for s in series} - {node_name}
+    )
+    if leaked:
+        raise PmmApiError(
+            "The PMM metrics backend ignored the node filter (extra_label) and returned "
+            f"other nodes too: {', '.join(leaked)}. Per-node analysis needs PMM with "
+            "VictoriaMetrics (PMM 2.12 or newer)."
+        )
+
+
+# ==========================================
 # 5. FETCHING METRICS FROM THE PROMETHEUS API
 # ==========================================
-def fetch_prometheus_metrics(session, start_time, end_time, step):
+def fetch_prometheus_metrics(session, start_time, end_time, step, node_name=""):
     print(f"⏳ Fetching Prometheus metrics via the PMM API (step {step})...")
     time_series_data = {}
 
@@ -616,6 +749,7 @@ def fetch_prometheus_metrics(session, start_time, end_time, step):
             "start": int(start_time.timestamp()),
             "end": int(end_time.timestamp()),
             "step": step,
+            **node_extra_label(node_name),
         }
         try:
             r = session.get(url, params=params, timeout=PMM_REQUEST_TIMEOUT)
@@ -659,12 +793,13 @@ def _parse_prom_float(value):
     return float_val
 
 
-def prometheus_instant_query(session, query, when):
+def prometheus_instant_query(session, query, when, node_name=""):
     """Run a Prometheus instant query at `when`. Returns a list of {metric, value}."""
     url = pmm_url("/prometheus/api/v1/query")
     params = {
         "query": query,
         "time": int(when.timestamp()),
+        **node_extra_label(node_name),
     }
     try:
         response = session.get(url, params=params, timeout=PMM_REQUEST_TIMEOUT)
@@ -709,7 +844,7 @@ def _process_group_identity(metric):
     return groupname, node_name, service_name
 
 
-def fetch_top_process_groups(session, start_time, end_time):
+def fetch_top_process_groups(session, start_time, end_time, node_name=""):
     """Top process-exporter groups by peak RSS and process count over the window."""
     print("⏳ Fetching process-exporter groups via the PMM API...")
     duration_s = max(int((end_time - start_time).total_seconds()), 60)
@@ -725,7 +860,7 @@ def fetch_top_process_groups(session, start_time, end_time):
     )
 
     groups = {}
-    for series in prometheus_instant_query(session, count_query, end_time):
+    for series in prometheus_instant_query(session, count_query, end_time, node_name):
         groupname, node_name, service_name = _process_group_identity(series["metric"])
         if not groupname:
             continue
@@ -735,7 +870,7 @@ def fetch_top_process_groups(session, start_time, end_time):
         )
         entry["process_count"] = round(series["value"], 2)
 
-    for series in prometheus_instant_query(session, rss_query, end_time):
+    for series in prometheus_instant_query(session, rss_query, end_time, node_name):
         groupname, node_name, service_name = _process_group_identity(series["metric"])
         if not groupname:
             continue
@@ -868,12 +1003,20 @@ def _example_text(example):
     )
 
 
-def fetch_qan_example(session, path, period, queryid):
+def qan_node_labels(node_name):
+    """QAN filter limiting reports and examples to one node (both PMM 2 and 3)."""
+    if not node_name:
+        return {}
+    return {"labels": [{"key": "node_name", "value": [node_name]}]}
+
+
+def fetch_qan_example(session, path, period, queryid, node_name=""):
     payload = {
         **period,
         "group_by": "queryid",
         "filter_by": queryid,
         "limit": 1,
+        **qan_node_labels(node_name),
     }
     data = _qan_post(session, path, payload)
     examples = data.get("query_examples") or data.get("queryExamples") or []
@@ -893,7 +1036,7 @@ def fetch_qan_labels(session, path, period, queryid):
     return data.get("labels") or {}
 
 
-def qan_row_to_query(session, paths, period, row):
+def qan_row_to_query(session, paths, period, row, node_name="", node_services=None):
     queryid = _first_string(row.get("dimension"), row.get("Dimension"))
     fingerprint = _first_string(row.get("fingerprint"), row.get("Fingerprint"))
     database = _first_string(row.get("database"), row.get("Database"))
@@ -916,7 +1059,9 @@ def qan_row_to_query(session, paths, period, row):
     sample_sql = ""
     labels = {}
     try:
-        example, sample_sql = fetch_qan_example(session, paths["example"], period, queryid)
+        example, sample_sql = fetch_qan_example(
+            session, paths["example"], period, queryid, node_name
+        )
     except PmmApiError as e:
         print(f"⚠️ Could not fetch a query example for {queryid}: {e}", file=sys.stderr)
     try:
@@ -947,6 +1092,10 @@ def qan_row_to_query(session, paths, period, row):
         ]
         + _label_values(labels, "service_name", "serviceName")
     )
+    if node_services:
+        # GetLabels cannot be filtered by node, so it also returns services of
+        # other nodes that ran the same query; keep only this node's services.
+        service_names = [name for name in service_names if name in node_services]
 
     query = {
         "queryid": queryid,
@@ -965,7 +1114,7 @@ def qan_row_to_query(session, paths, period, row):
     return query
 
 
-def fetch_qan_queries(session, pmm_major, start_time, end_time):
+def fetch_qan_queries(session, pmm_major, start_time, end_time, node_name="", node_services=None):
     paths = QAN_API[pmm_major]
     period = {
         "period_start_from": to_rfc3339_utc(start_time),
@@ -981,6 +1130,7 @@ def fetch_qan_queries(session, pmm_major, start_time, end_time):
         "limit": QAN_QUERY_LIMIT,
         "offset": 0,
         "columns": ["query_time", "rows_examined", "num_queries"],
+        **qan_node_labels(node_name),
     }
 
     try:
@@ -995,7 +1145,9 @@ def fetch_qan_queries(session, pmm_major, start_time, end_time):
         if not isinstance(row, dict) or _is_totals_row(row):
             continue
         try:
-            queries.append(qan_row_to_query(session, paths, period, row))
+            queries.append(
+                qan_row_to_query(session, paths, period, row, node_name, node_services)
+            )
         except Exception as e:
             queryid = _first_string(row.get("dimension"), row.get("Dimension")) or "?"
             print(f"⚠️ Skipping QAN row {queryid}: {e}", file=sys.stderr)
@@ -1213,9 +1365,6 @@ if __name__ == "__main__":
         sys.exit(2)
 
     period_label = format_period(start_time, end_time)
-    output_file = args.output or (
-        f"pmm_telemetry_{start_time:%Y%m%d-%H%M}_{end_time:%Y%m%d-%H%M}.json"
-    )
     print(f"🗓️  Analyzed period: {period_label}")
 
     session = pmm_session()
@@ -1225,17 +1374,75 @@ if __name__ == "__main__":
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Select the node (server) to analyze
+    node_name = ""
+    try:
+        available_nodes = list_node_names(session, start_time, end_time)
+    except PmmApiError as e:
+        if args.server or args.list_servers:
+            print(f"❌ {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"⚠️ Could not list PMM nodes: {e}", file=sys.stderr)
+        available_nodes = []
+
+    if args.list_servers:
+        print(f"🖥️  Nodes with metrics in {period_label}:")
+        for name in available_nodes:
+            print(f"   {name}")
+        sys.exit(0)
+
+    if args.server:
+        try:
+            node_name = resolve_node_name(args.server, available_nodes)
+            verify_node_filter(session, node_name, start_time, end_time)
+        except (ValueError, PmmApiError) as e:
+            print(f"❌ {e}", file=sys.stderr)
+            sys.exit(2)
+        if node_name != args.server.strip():
+            print(f"ℹ️  --server {args.server} matched the PMM node {node_name}")
+        print(f"🖥️  Analyzed server: {node_name}")
+    elif len(available_nodes) > 1:
+        print(
+            f"⚠️ PMM has data for {len(available_nodes)} nodes ({', '.join(available_nodes)}), "
+            "and without --server their metrics and queries are mixed. "
+            "Select one with --server NODE.",
+            file=sys.stderr,
+        )
+
+    node_suffix = f"_{re.sub(r'[^A-Za-z0-9._-]+', '_', node_name)}" if node_name else ""
+    output_file = args.output or (
+        f"pmm_telemetry{node_suffix}_{start_time:%Y%m%d-%H%M}_{end_time:%Y%m%d-%H%M}.json"
+    )
+    scope_label = f"server {node_name}, {period_label}" if node_name else period_label
+
     # 1. Collect data
-    metrics_history = fetch_prometheus_metrics(session, start_time, end_time, args.step)
-    top_queries = fetch_qan_queries(session, pmm_major, start_time, end_time)
-    top_process_groups = fetch_top_process_groups(session, start_time, end_time)
+    metrics_history = fetch_prometheus_metrics(
+        session, start_time, end_time, args.step, node_name
+    )
+    node_services = set()
+    if node_name:
+        try:
+            node_services = set(
+                list_label_values(session, "service_name", start_time, end_time, node_name)
+            )
+        except PmmApiError as e:
+            print(f"⚠️ Could not list the services of {node_name}: {e}", file=sys.stderr)
+    top_queries = fetch_qan_queries(
+        session, pmm_major, start_time, end_time, node_name, node_services
+    )
+    top_process_groups = fetch_top_process_groups(session, start_time, end_time, node_name)
 
     if not metrics_history:
-        print("❌ No Prometheus metrics were found. Check PMM_URL and the password.", file=sys.stderr)
+        hint = f" for node {node_name}" if node_name else ""
+        print(
+            f"❌ No Prometheus metrics were found{hint}. Check PMM_URL and the password.",
+            file=sys.stderr,
+        )
         sys.exit(1)
         
     # 2. Full payload to save to a file
     full_payload = {
+        "node_name": node_name or None,
         "period_start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "period_end": end_time.strftime("%Y-%m-%d %H:%M:%S"),
         "granularity": args.step,
@@ -1261,6 +1468,7 @@ if __name__ == "__main__":
     print(f"✅ Successfully filtered data: {len(anomaly_timeline)} critical points kept out of {len(metrics_history)} ({tokens_saved_pct}% tokens saved).")
 
     ai_payload = {
+        "analyzed_server": node_name or "all PMM nodes",
         "analyzed_period": period_label,
         "period_summary": summary_stats,
         "anomalies_and_spikes_timeline": anomaly_timeline,
@@ -1270,7 +1478,7 @@ if __name__ == "__main__":
 
     # 4. Prepare the prompt
     system_prompt = f"""You are a principal Database Reliability Engineer (DBRE) and Linux Performance Expert.
-Analyze the provided PMM telemetry data from the given date and time range.
+Analyze the provided PMM telemetry data from the given date and time range{f" for the server (PMM node) {node_name}" if node_name else ""}.
 Note: The data contains an overall statistical summary for the whole period plus chronological slices ONLY for the recorded peaks and anomalies, the top process groups by memory/count, and the top slow SQL queries from Query Analytics (QAN). Metrics cover:
   - System: CPU usage/load, CPU iowait % and steal % (VM noisy-neighbor signal), RAM/swap.
   - Disk: read/write throughput, %util (`disk_io_util_pct`), read/write latency in ms, and lowest free-space % across all mounts (`disk_free_min_pct`).
@@ -1289,12 +1497,12 @@ Produce a detailed Root Cause Analysis:
 
     # Text shown on the console
     user_prompt_display = (
-        f"Period: {period_label}\n"
+        f"Scope: {scope_label}\n"
         f"Size of data being sent: {len(anomaly_timeline)} points (out of {len(metrics_history)} total)."
     )
 
     # Full user prompt, including the JSON payload for the API
-    full_user_prompt_with_json = f"""Please analyze the provided Percona Monitoring and Management (PMM) telemetry data for the period {period_label} and produce a Root Cause Analysis.
+    full_user_prompt_with_json = f"""Please analyze the provided Percona Monitoring and Management (PMM) telemetry data for {scope_label} and produce a Root Cause Analysis.
 
 Here is the structured data for anomalies, overall statistics for the period, top process groups, and the top problematic SQL queries:
 
